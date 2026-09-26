@@ -1,4 +1,5 @@
 # Gym Tracker
+nLive at https://gym-tracker.ctcapps.workers.dev
 
 Shared weigh-in and personal-best tracker for Sam, Ebe and Selva. Cloudflare Worker + D1.
 
