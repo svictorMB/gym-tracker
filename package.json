@@ -4,7 +4,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:init": "wrangler d1 execute gym-tracker --remote --file=schema.sql"
+    "db:migrate": "wrangler d1 migrations apply gym-tracker --remote",
+    "db:migrate:local": "wrangler d1 migrations apply gym-tracker --local"
   },
-  "devDependencies": { "wrangler": "^4" }
+  "devDependencies": {
+    "wrangler": "^4"
+  }
 }
