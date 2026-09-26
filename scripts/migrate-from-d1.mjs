@@ -1,0 +1,45 @@
+// One-off: copy lifts and weights from the old Cloudflare D1 database into Supabase.
+// Reads SUPABASE_URL / SUPABASE_SERVICE_KEY from .dev.vars (or the environment).
+// Rows are inserted with user_id NULL and attach to accounts when people set up their profile.
+// Usage: node scripts/migrate-from-d1.mjs [--dry-run]
+import { execFileSync } from "node:child_process";
+import { readFileSync, existsSync } from "node:fs";
+
+const dry = process.argv.includes("--dry-run");
+const env = { ...process.env };
+if (existsSync(".dev.vars")) {
+  for (const line of readFileSync(".dev.vars", "utf8").split(/\r?\n/)) {
+    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/); if (m && !env[m[1]]) env[m[1]] = m[2].replace(/^["']|["']$/g, "");
+  }
+}
+const { SUPABASE_URL, SUPABASE_SERVICE_KEY } = env;
+if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) { console.error("Need SUPABASE_URL and SUPABASE_SERVICE_KEY in .dev.vars or the environment"); process.exit(1); }
+
+function d1(sql) {
+  const out = execFileSync("npx", ["wrangler", "d1", "execute", "gym-tracker", "--remote", "--json", "--command", sql], { encoding: "utf8", shell: process.platform === "win32" });
+  return JSON.parse(out)[0].results;
+}
+async function sb(path, opts = {}) {
+  const r = await fetch(SUPABASE_URL + "/rest/v1/" + path, {
+    method: opts.method || "GET",
+    headers: { apikey: SUPABASE_SERVICE_KEY, authorization: "Bearer " + SUPABASE_SERVICE_KEY, "content-type": "application/json", prefer: opts.prefer || "return=minimal" },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const text = await r.text();
+  if (!r.ok) throw new Error("Supabase " + r.status + ": " + text.slice(0, 300));
+  return text ? JSON.parse(text) : null;
+}
+
+const lifts = d1("SELECT person, date, workout, exercise, weight, reps, created_at FROM lifts ORDER BY id");
+const weights = d1("SELECT person, date, lbs, created_at FROM weights ORDER BY id");
+console.log("D1 has", lifts.length, "lifts and", weights.length, "weigh-ins");
+
+const existing = await sb("lifts?select=id&limit=1", { prefer: "count=exact" });
+const already = (await sb("lifts?select=id", { prefer: "" })).length + (await sb("weights?select=id", { prefer: "" })).length;
+if (already) { console.error("Supabase already has", already, "rows; refusing to import twice. Empty the tables first if you really want to re-run."); process.exit(1); }
+if (dry) { console.log("Dry run: nothing written."); process.exit(0); }
+
+const iso = t => t.replace(" ", "T") + "Z";
+await sb("lifts", { method: "POST", body: lifts.map(l => ({ person: l.person, date: l.date, workout: l.workout, exercise: l.exercise, weight: l.weight, reps: l.reps, created_at: iso(l.created_at) })) });
+await sb("weights", { method: "POST", body: weights.map(w => ({ person: w.person, date: w.date, lbs: w.lbs, created_at: iso(w.created_at) })) });
+console.log("Imported", lifts.length, "lifts and", weights.length, "weigh-ins into Supabase (user_id NULL until profiles are created).");

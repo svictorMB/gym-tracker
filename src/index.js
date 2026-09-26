@@ -1,7 +1,7 @@
-// Gym Tracker — Cloudflare Worker + D1
-// Binding required: DB -> D1 database "gym-tracker"
-// Accounts: email + password (PBKDF2), cookie sessions stored in D1.
-// Buddies: friend request + accept. You see (and can log for) yourself and accepted buddies.
+// Gym Tracker — Cloudflare Worker + Supabase
+// Identity: Supabase Auth magic links (the browser talks to Supabase Auth directly with the anon key).
+// Data: Supabase Postgres via PostgREST, accessed only from this Worker with the service role key.
+// Config: SUPABASE_URL and SUPABASE_ANON_KEY as vars, SUPABASE_SERVICE_KEY as a secret.
 
 const WORKOUTS = {
   A: ["Leg press", "Chest press machine", "Seated cable row", "Dumbbell Romanian deadlift", "Seated shoulder press machine", "Plank (seconds)"],
@@ -23,7 +23,7 @@ const CUES = {
   "Dead bug (reps per side)": "Lower back pressed into the floor. Extend the opposite arm and leg, exhale as you extend, alternate sides.",
 };
 
-// Logs saved before accounts existed are attached to whoever registers with these emails,
+// Logs saved before accounts existed are attached to whoever signs in with these emails,
 // and these three are made buddies with each other automatically.
 const LEGACY = {
   "samueldavidson@gmail.com": "Sam",
@@ -32,8 +32,6 @@ const LEGACY = {
 };
 
 const PALETTE = ["#1F4FD8", "#D9772B", "#1E8E55", "#8E44AD", "#C2185B", "#00838F", "#6D4C41", "#455A64"];
-const SESSION_DAYS = 90;
-const PBKDF2_ITERATIONS = 100000;
 
 export default {
   async fetch(request, env) {
@@ -42,174 +40,137 @@ export default {
       try { return await api(request, env, url); }
       catch (e) { return json({ error: "Server error: " + (e && e.message ? e.message : e) }, 500); }
     }
-    return new Response(HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+    const cfg = JSON.stringify({ url: env.SUPABASE_URL || "", anonKey: env.SUPABASE_ANON_KEY || "" }).replace(/</g, "\\u003c");
+    return new Response(HTML.replace("__SB_CONFIG__", cfg), { headers: { "content-type": "text/html; charset=utf-8" } });
   },
 };
 
 // ---------- helpers ----------
 
-function json(data, status = 200, headers = {}) {
-  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...headers } });
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 }
 
-const enc = new TextEncoder();
-const hex = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
-function randomHex(bytes) { const a = new Uint8Array(bytes); crypto.getRandomValues(a); return hex(a); }
+const pub = p => ({ id: p.id, username: p.username, name: p.name, color: PALETTE[Number(p.seq || 0) % PALETTE.length] });
+const q = encodeURIComponent;
 
-async function hashPassword(password, saltHex) {
-  const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
-  const salt = new Uint8Array(saltHex.match(/../g).map(h => parseInt(h, 16)));
-  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: PBKDF2_ITERATIONS }, key, 256);
-  return hex(bits);
+// PostgREST call with the service role key.
+async function sb(env, path, opts = {}) {
+  const method = opts.method || "GET";
+  const headers = { apikey: env.SUPABASE_SERVICE_KEY, authorization: "Bearer " + env.SUPABASE_SERVICE_KEY, "content-type": "application/json" };
+  if (opts.prefer) headers.prefer = opts.prefer; else if (method !== "GET") headers.prefer = "return=representation";
+  const r = await fetch(env.SUPABASE_URL + "/rest/v1/" + path, { method, headers, body: opts.body === undefined ? undefined : JSON.stringify(opts.body) });
+  const text = await r.text();
+  if (!r.ok) throw new Error("Supabase " + r.status + ": " + text.slice(0, 300));
+  return text ? JSON.parse(text) : null;
 }
 
-function safeEqual(a, b) {
-  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
-  let r = 0; for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return r === 0;
-}
-
-function getCookie(request, name) {
-  const m = (request.headers.get("cookie") || "").match(new RegExp("(?:^|;\\s*)" + name + "=([^;]+)"));
-  return m ? m[1] : null;
-}
-
-function sessionCookie(id, url, maxAge) {
-  return "gt_session=" + id + "; Path=/; HttpOnly; SameSite=Lax" + (url.protocol === "https:" ? "; Secure" : "") + "; Max-Age=" + maxAge;
-}
-
-const pub = u => ({ id: u.id, username: u.username, name: u.name, color: PALETTE[u.id % PALETTE.length] });
-
+// Validates the browser's Supabase access token and loads the profile.
 async function currentUser(request, env) {
-  const sid = getCookie(request, "gt_session");
-  if (!sid) return null;
-  return await env.DB.prepare(
-    "SELECT u.id, u.email, u.username, u.name FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = ? AND s.expires_at > datetime('now')"
-  ).bind(sid).first();
-}
-
-async function startSession(env, user, url) {
-  const sid = randomHex(32);
-  await env.DB.prepare("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, datetime('now', ?))")
-    .bind(sid, user.id, "+" + SESSION_DAYS + " days").run();
-  return json({ ok: true, user: pub(user) }, 200, { "set-cookie": sessionCookie(sid, url, SESSION_DAYS * 86400) });
+  const auth = request.headers.get("authorization") || "";
+  if (!/^Bearer \S+$/.test(auth)) return null;
+  const r = await fetch(env.SUPABASE_URL + "/auth/v1/user", { headers: { apikey: env.SUPABASE_ANON_KEY, authorization: auth } });
+  if (!r.ok) return null;
+  const u = await r.json();
+  if (!u || !u.id) return null;
+  const rows = await sb(env, "profiles?id=eq." + u.id + "&select=id,seq,email,username,name");
+  return { id: u.id, email: String(u.email || "").toLowerCase(), profile: rows[0] || null };
 }
 
 async function friendsOf(env, uid) {
-  const r = await env.DB.prepare(
-    `SELECT f.id AS fid, f.status, f.requester_id, f.addressee_id, u.id, u.username, u.name
-     FROM friendships f
-     JOIN users u ON u.id = CASE WHEN f.requester_id = ? THEN f.addressee_id ELSE f.requester_id END
-     WHERE f.requester_id = ? OR f.addressee_id = ?
-     ORDER BY u.name COLLATE NOCASE`
-  ).bind(uid, uid, uid).all();
+  const rows = await sb(env, "friendships?or=(requester_id.eq." + uid + ",addressee_id.eq." + uid + ")" +
+    "&select=id,status,requester_id,addressee_id,requester:profiles!friendships_requester_id_fkey(id,seq,username,name),addressee:profiles!friendships_addressee_id_fkey(id,seq,username,name)");
   const accepted = [], incoming = [], outgoing = [];
-  for (const row of r.results) {
-    const item = { fid: row.fid, ...pub(row) };
-    if (row.status === "accepted") accepted.push(item);
-    else if (row.addressee_id === uid) incoming.push(item);
+  for (const f of rows) {
+    const other = f.requester_id === uid ? f.addressee : f.requester;
+    if (!other) continue;
+    const item = { fid: f.id, ...pub(other) };
+    if (f.status === "accepted") accepted.push(item);
+    else if (f.addressee_id === uid) incoming.push(item);
     else outgoing.push(item);
   }
-  return { accepted, incoming, outgoing };
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  return { accepted: accepted.sort(byName), incoming: incoming.sort(byName), outgoing: outgoing.sort(byName) };
 }
 
 // ---------- API ----------
 
 async function api(request, env, url) {
+  if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY || !env.SUPABASE_SERVICE_KEY) return json({ error: "Supabase isn't configured on the server yet" }, 500);
   const path = url.pathname.slice(5);
   const method = request.method;
-  if (method === "POST" && !(request.headers.get("content-type") || "").includes("application/json")) {
-    return json({ error: "Expected JSON" }, 415);
-  }
+  if (method === "POST" && !(request.headers.get("content-type") || "").includes("application/json")) return json({ error: "Expected JSON" }, 415);
   const body = async () => { try { return await request.json(); } catch { return {}; } };
 
-  // --- accounts ---
-  if (method === "POST" && path === "register") {
-    const b = await body();
-    const email = String(b.email || "").trim().toLowerCase();
-    const username = String(b.username || "").trim().toLowerCase().replace(/^@/, "");
-    const name = String(b.name || "").trim();
-    const password = String(b.password || "");
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return json({ error: "Enter a valid email" }, 400);
-    if (!/^[a-z0-9_]{3,20}$/.test(username)) return json({ error: "Username: 3–20 letters, numbers or underscores" }, 400);
-    if (!name || name.length > 30) return json({ error: "Enter a display name (up to 30 characters)" }, 400);
-    if (password.length < 8) return json({ error: "Password needs at least 8 characters" }, 400);
-    const exists = await env.DB.prepare("SELECT id FROM users WHERE email = ? OR username = ?").bind(email, username).first();
-    if (exists) return json({ error: "That email or username is already taken" }, 409);
-    const salt = randomHex(16);
-    const pass_hash = await hashPassword(password, salt);
-    const ins = await env.DB.prepare("INSERT INTO users (email, username, name, pass_hash, salt) VALUES (?, ?, ?, ?, ?)")
-      .bind(email, username, name, pass_hash, salt).run();
-    const uid = ins.meta.last_row_id;
-    if (LEGACY[email]) {
-      const legacyName = LEGACY[email];
-      const crew = Object.keys(LEGACY).filter(e => e !== email);
-      const others = await env.DB.prepare(`SELECT id FROM users WHERE email IN (${crew.map(() => "?").join(",")})`).bind(...crew).all();
-      await env.DB.batch([
-        env.DB.prepare("UPDATE lifts SET user_id = ? WHERE user_id IS NULL AND person = ?").bind(uid, legacyName),
-        env.DB.prepare("UPDATE weights SET user_id = ? WHERE user_id IS NULL AND person = ?").bind(uid, legacyName),
-        ...others.results.map(o => env.DB.prepare("INSERT OR IGNORE INTO friendships (requester_id, addressee_id, status) VALUES (?, ?, ?)").bind(uid, o.id, "accepted")),
-      ]);
-    }
-    return startSession(env, { id: uid, email, username, name }, url);
-  }
-
-  if (method === "POST" && path === "login") {
-    const b = await body();
-    const ident = String(b.identity || "").trim().toLowerCase().replace(/^@/, "");
-    const password = String(b.password || "");
-    const u = await env.DB.prepare("SELECT id, email, username, name, pass_hash, salt FROM users WHERE email = ? OR username = ?").bind(ident, ident).first();
-    const attempt = await hashPassword(password, u ? u.salt : randomHex(16));
-    if (!u || !safeEqual(attempt, u.pass_hash)) return json({ error: "Wrong email/username or password" }, 401);
-    return startSession(env, u, url);
-  }
-
-  if (method === "POST" && path === "logout") {
-    const sid = getCookie(request, "gt_session");
-    if (sid) await env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(sid).run();
-    return json({ ok: true }, 200, { "set-cookie": sessionCookie("", url, 0) });
-  }
-
   const me = await currentUser(request, env);
-  if (method === "GET" && path === "me") return json({ user: me ? pub(me) : null });
+  if (method === "GET" && path === "me") return json({ user: me ? { id: me.id, email: me.email } : null, profile: me && me.profile ? pub(me.profile) : null });
   if (!me) return json({ error: "Please sign in" }, 401);
 
+  // --- first-time profile ---
+  if (method === "POST" && path === "profile") {
+    if (me.profile) return json({ error: "Profile already set up" }, 409);
+    const b = await body();
+    const username = String(b.username || "").trim().toLowerCase().replace(/^@/, "");
+    const name = String(b.name || "").trim();
+    if (!/^[a-z0-9_]{3,20}$/.test(username)) return json({ error: "Username: 3–20 letters, numbers or underscores" }, 400);
+    if (!name || name.length > 30) return json({ error: "Enter a display name (up to 30 characters)" }, 400);
+    const taken = await sb(env, "profiles?username=eq." + q(username) + "&select=id");
+    if (taken.length) return json({ error: "That username is taken" }, 409);
+    const [prof] = await sb(env, "profiles", { method: "POST", body: { id: me.id, email: me.email, username, name } });
+    const legacyName = LEGACY[me.email];
+    if (legacyName) {
+      await sb(env, "lifts?user_id=is.null&person=eq." + q(legacyName), { method: "PATCH", body: { user_id: me.id }, prefer: "return=minimal" });
+      await sb(env, "weights?user_id=is.null&person=eq." + q(legacyName), { method: "PATCH", body: { user_id: me.id }, prefer: "return=minimal" });
+      const crew = Object.keys(LEGACY).filter(e => e !== me.email);
+      const others = await sb(env, "profiles?email=in." + q("(" + crew.map(e => '"' + e + '"').join(",") + ")") + "&select=id");
+      if (others.length) {
+        await sb(env, "friendships?on_conflict=requester_id,addressee_id", {
+          method: "POST", prefer: "return=minimal,resolution=ignore-duplicates",
+          body: others.map(o => ({ requester_id: me.id, addressee_id: o.id, status: "accepted" })),
+        });
+      }
+    }
+    return json({ ok: true, profile: pub(prof) });
+  }
+  if (!me.profile) return json({ error: "Finish setting up your profile first" }, 403);
+
   const friends = await friendsOf(env, me.id);
-  const circle = [pub(me), ...friends.accepted.map(({ fid, ...u }) => u)];
+  const circle = [pub(me.profile), ...friends.accepted.map(({ fid, ...u }) => u)];
   const ids = circle.map(u => u.id);
-  const placeholders = ids.map(() => "?").join(",");
+  const inIds = "in.(" + ids.join(",") + ")";
   const nameOf = uid => (circle.find(u => u.id === uid) || {}).name;
 
   // --- data ---
   if (method === "GET" && path === "data") {
     const [weights, lifts] = await Promise.all([
-      env.DB.prepare(`SELECT id, user_id, date, lbs FROM weights WHERE user_id IN (${placeholders}) ORDER BY date ASC, id ASC`).bind(...ids).all(),
-      env.DB.prepare(`SELECT id, user_id, date, workout, exercise, weight, reps FROM lifts WHERE user_id IN (${placeholders}) ORDER BY date DESC, id DESC`).bind(...ids).all(),
+      sb(env, "weights?user_id=" + inIds + "&select=id,user_id,date,lbs&order=date.asc,id.asc"),
+      sb(env, "lifts?user_id=" + inIds + "&select=id,user_id,date,workout,exercise,weight,reps&order=date.desc,id.desc"),
     ]);
-    return json({ user: pub(me), people: circle, friends, workouts: WORKOUTS, cues: CUES, weights: weights.results, lifts: lifts.results });
+    return json({ user: pub(me.profile), people: circle, friends, workouts: WORKOUTS, cues: CUES, weights, lifts });
   }
 
   if (method === "POST" && path === "weight") {
     const b = await body();
-    const uid = Number(b.for || me.id);
+    const uid = String(b.for || me.id);
     if (!ids.includes(uid)) return json({ error: "You can only log for yourself or a buddy" }, 403);
-    if (!b.date || !(b.lbs > 0)) return json({ error: "Need a date and a weight" }, 400);
-    await env.DB.prepare("INSERT INTO weights (user_id, person, date, lbs) VALUES (?, ?, ?, ?)").bind(uid, nameOf(uid), b.date, b.lbs).run();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(b.date || "")) || !(b.lbs > 0)) return json({ error: "Need a date and a weight" }, 400);
+    await sb(env, "weights", { method: "POST", body: { user_id: uid, person: nameOf(uid), date: b.date, lbs: Number(b.lbs) }, prefer: "return=minimal" });
     return json({ ok: true });
   }
 
   if (method === "POST" && path === "lifts") {
     const b = await body();
-    const uid = Number(b.for || me.id);
+    const uid = String(b.for || me.id);
     if (!ids.includes(uid)) return json({ error: "You can only log for yourself or a buddy" }, 403);
     const raw = Array.isArray(b.sets) ? b.sets : [];
     const sets = raw.filter(x => x && (String(x.weight ?? "").trim() !== "" || String(x.reps ?? "").trim() !== ""))
                     .map(x => ({ weight: Number(x.weight), reps: Number(x.reps) }));
-    const valid = b.date && WORKOUTS[b.workout]?.includes(b.exercise) && sets.length > 0 && sets.every(x => x.weight >= 0 && x.reps > 0);
+    const valid = /^\d{4}-\d{2}-\d{2}$/.test(String(b.date || "")) && WORKOUTS[b.workout]?.includes(b.exercise)
+      && sets.length > 0 && sets.every(x => x.weight >= 0 && Number.isInteger(x.reps) && x.reps > 0);
     if (!valid) return json({ error: "Need a date, exercise and at least one set with weight and reps" }, 400);
-    const stmt = env.DB.prepare("INSERT INTO lifts (user_id, person, date, workout, exercise, weight, reps) VALUES (?, ?, ?, ?, ?, ?, ?)");
-    const clear = env.DB.prepare("DELETE FROM lifts WHERE user_id = ? AND date = ? AND exercise = ?").bind(uid, b.date, b.exercise);
-    await env.DB.batch([clear, ...sets.map(x => stmt.bind(uid, nameOf(uid), b.date, b.workout, b.exercise, x.weight, x.reps))]);
+    await sb(env, "lifts?user_id=eq." + uid + "&date=eq." + b.date + "&exercise=eq." + q(b.exercise), { method: "DELETE", prefer: "return=minimal" });
+    await sb(env, "lifts", { method: "POST", prefer: "return=minimal",
+      body: sets.map(x => ({ user_id: uid, person: nameOf(uid), date: b.date, workout: b.workout, exercise: b.exercise, weight: x.weight, reps: x.reps })) });
     return json({ ok: true, saved: sets.length });
   }
 
@@ -217,7 +178,7 @@ async function api(request, env, url) {
     const rowIds = (url.searchParams.get("ids") || url.searchParams.get("id") || "").split(",").map(Number).filter(n => Number.isInteger(n) && n > 0);
     if (!rowIds.length) return json({ error: "Missing id" }, 400);
     const table = path === "weight" ? "weights" : "lifts";
-    await env.DB.prepare(`DELETE FROM ${table} WHERE id IN (${rowIds.map(() => "?").join(",")}) AND user_id IN (${placeholders})`).bind(...rowIds, ...ids).run();
+    await sb(env, table + "?id=in.(" + rowIds.join(",") + ")&user_id=" + inIds, { method: "DELETE", prefer: "return=minimal" });
     return json({ ok: true });
   }
 
@@ -225,33 +186,31 @@ async function api(request, env, url) {
   if (method === "POST" && path === "friends/request") {
     const b = await body();
     const username = String(b.username || "").trim().toLowerCase().replace(/^@/, "");
-    if (!username) return json({ error: "Enter a username" }, 400);
-    const other = await env.DB.prepare("SELECT id, username, name FROM users WHERE username = ?").bind(username).first();
-    if (!other) return json({ error: "No one with that username yet. Ask them to register first." }, 404);
+    if (!/^[a-z0-9_]{3,20}$/.test(username)) return json({ error: "Enter a username" }, 400);
+    const [other] = await sb(env, "profiles?username=eq." + q(username) + "&select=id,seq,username,name");
+    if (!other) return json({ error: "No one with that username yet. Ask them to sign in and set up their profile first." }, 404);
     if (other.id === me.id) return json({ error: "That's you" }, 400);
-    const existing = await env.DB.prepare(
-      "SELECT id, status, requester_id FROM friendships WHERE (requester_id = ? AND addressee_id = ?) OR (requester_id = ? AND addressee_id = ?)"
-    ).bind(me.id, other.id, other.id, me.id).first();
+    const [existing] = await sb(env, "friendships?or=(and(requester_id.eq." + me.id + ",addressee_id.eq." + other.id + "),and(requester_id.eq." + other.id + ",addressee_id.eq." + me.id + "))&select=id,status,requester_id");
     if (existing) {
       if (existing.status === "accepted") return json({ error: other.name + " is already your buddy" }, 409);
       if (existing.requester_id === me.id) return json({ error: "Request already sent. Waiting for " + other.name + " to accept." }, 409);
-      await env.DB.prepare("UPDATE friendships SET status = 'accepted' WHERE id = ?").bind(existing.id).run();
+      await sb(env, "friendships?id=eq." + existing.id, { method: "PATCH", body: { status: "accepted" }, prefer: "return=minimal" });
       return json({ ok: true, message: other.name + " had already asked you, so you're buddies now." });
     }
-    await env.DB.prepare("INSERT INTO friendships (requester_id, addressee_id, status) VALUES (?, ?, 'pending')").bind(me.id, other.id).run();
+    await sb(env, "friendships", { method: "POST", body: { requester_id: me.id, addressee_id: other.id, status: "pending" }, prefer: "return=minimal" });
     return json({ ok: true, message: "Request sent to " + other.name + "." });
   }
 
   if (method === "POST" && path === "friends/accept") {
     const b = await body();
-    const r = await env.DB.prepare("UPDATE friendships SET status = 'accepted' WHERE id = ? AND addressee_id = ? AND status = 'pending'").bind(Number(b.id), me.id).run();
-    if (!r.meta.changes) return json({ error: "Request not found" }, 404);
+    const rows = await sb(env, "friendships?id=eq." + Number(b.id) + "&addressee_id=eq." + me.id + "&status=eq.pending", { method: "PATCH", body: { status: "accepted" } });
+    if (!rows.length) return json({ error: "Request not found" }, 404);
     return json({ ok: true });
   }
 
   if (method === "POST" && path === "friends/remove") {
     const b = await body();
-    await env.DB.prepare("DELETE FROM friendships WHERE id = ? AND (requester_id = ? OR addressee_id = ?)").bind(Number(b.id), me.id, me.id).run();
+    await sb(env, "friendships?id=eq." + Number(b.id) + "&or=(requester_id.eq." + me.id + ",addressee_id.eq." + me.id + ")", { method: "DELETE", prefer: "return=minimal" });
     return json({ ok: true });
   }
 
@@ -301,6 +260,7 @@ const HTML = `<!doctype html>
   .msg{min-height:20px;font-size:14px;margin-top:8px;color:var(--muted)}
   .msg.pb{color:var(--pb);font-weight:600}
   .msg.err{color:var(--danger)}
+  .msg.ok{color:var(--pb)}
   table{width:100%;border-collapse:collapse;font-size:15px}
   th{font-weight:600;color:var(--muted);text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);font-size:13px}
   td{padding:9px 6px;border-bottom:1px solid var(--line);vertical-align:top}
@@ -311,10 +271,9 @@ const HTML = `<!doctype html>
   .empty{color:var(--muted);font-size:15px;margin:6px 0}
   svg{width:100%;height:auto;display:block}
   .legend{display:flex;gap:14px;font-size:14px;margin-top:6px;color:var(--muted);flex-wrap:wrap}
-  .tabs,.seg{display:flex;gap:6px}
-  .tabs{margin-bottom:12px}
-  .tabs button,.seg button{flex:1;padding:10px 0;border:2px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);font-size:16px;font-weight:600;cursor:pointer}
-  .tabs button[aria-pressed=true],.seg button[aria-pressed=true]{border-color:var(--accent);color:var(--accent)}
+  .seg{display:flex;gap:6px}
+  .seg button{flex:1;padding:10px 0;border:2px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);font-size:16px;font-weight:600;cursor:pointer}
+  .seg button[aria-pressed=true]{border-color:var(--accent);color:var(--accent)}
   .inline{display:flex;gap:8px;margin:12px 0 0}
   .inline input{flex:1}
   .inline button,.mini{padding:0 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);cursor:pointer;font-size:14px}
@@ -359,22 +318,23 @@ const HTML = `<!doctype html>
   <p class="sub">Log weigh-ins and your sets. Buddies see each other's progress.</p>
 
   <section class="panel" id="auth" hidden>
-    <div class="tabs"><button type="button" data-t="login" aria-pressed="true">Log in</button><button type="button" data-t="register" aria-pressed="false">Register</button></div>
-    <form id="loginf">
-      <label for="li">Email or username</label><input id="li" autocomplete="username" required>
-      <label class="mt" for="lp">Password</label><input id="lp" type="password" autocomplete="current-password" required>
-      <button class="save" type="submit">Log in</button>
-      <div class="msg" id="loginmsg"></div>
+    <form id="linkf">
+      <label for="email">Email</label><input id="email" type="email" autocomplete="email" inputmode="email" placeholder="you@example.com" required>
+      <button class="save" type="submit" id="linkbtn">Email me a login link</button>
+      <div class="msg" id="linkmsg">No password needed. We'll send a link that signs you in on this device.</div>
     </form>
-    <form id="regf" hidden>
+  </section>
+
+  <section class="panel" id="setup" hidden>
+    <h2 style="margin:0 0 4px">Almost there</h2>
+    <p class="sub" style="margin-bottom:10px">Pick how you'll appear to your buddies. Signed in as <strong id="setupemail"></strong>.</p>
+    <form id="setupf">
       <div class="row" style="margin-top:0">
         <div><label for="rn">Your name</label><input id="rn" maxlength="30" autocomplete="name" required></div>
         <div><label for="ru">Username</label><input id="ru" autocomplete="username" autocapitalize="none" pattern="[A-Za-z0-9_]{3,20}" title="3–20 letters, numbers or underscores" required></div>
       </div>
-      <label class="mt" for="re">Email</label><input id="re" type="email" autocomplete="email" required>
-      <label class="mt" for="rp">Password (8+ characters)</label><input id="rp" type="password" autocomplete="new-password" minlength="8" required>
-      <button class="save" type="submit">Create account</button>
-      <div class="msg" id="regmsg"></div>
+      <button class="save" type="submit">Save profile</button>
+      <div class="msg" id="setupmsg"></div>
     </form>
   </section>
 
@@ -436,8 +396,10 @@ const HTML = `<!doctype html>
   </div>
 </main>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script>
 (() => {
+  const SB = __SB_CONFIG__;
   const $ = id => document.getElementById(id);
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   let data = null, me = null, person = null, savedPersonId = null;
@@ -446,53 +408,78 @@ const HTML = `<!doctype html>
   const today = new Date().toISOString().slice(0, 10);
   $("ldate").value = today; $("wdate").value = today;
   try {
-    savedPersonId = Number(localStorage.getItem("gt_person")) || null;
+    savedPersonId = localStorage.getItem("gt_person") || null;
     if (["A", "B"].includes(localStorage.getItem("gt_workout"))) workout = localStorage.getItem("gt_workout");
     const s = localStorage.getItem("gt_step") || "";
     if (s.startsWith(today + ":")) step = Number(s.slice(today.length + 1)) || 0;
   } catch {}
 
-  // ----- auth -----
-  function showAuth() { $("auth").hidden = false; $("app").hidden = true; $("me").hidden = true; data = null; me = null; }
-  function showApp() { $("auth").hidden = true; $("app").hidden = false; $("me").hidden = false; }
+  if (!SB.url || !SB.anonKey || !window.supabase) {
+    document.querySelector("main").insertAdjacentHTML("afterbegin", '<p class="msg err">Sign-in isn\\'t configured yet. Add the Supabase settings to the Worker and redeploy.</p>');
+    return;
+  }
+  // Implicit flow so the emailed link works even when it opens in a different browser than the one that requested it.
+  const supa = window.supabase.createClient(SB.url, SB.anonKey, { auth: { flowType: "implicit", persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
 
-  [...document.querySelectorAll(".tabs button")].forEach(b => b.onclick = () => {
-    [...document.querySelectorAll(".tabs button")].forEach(x => x.setAttribute("aria-pressed", x === b));
-    $("loginf").hidden = b.dataset.t !== "login"; $("regf").hidden = b.dataset.t !== "register";
-  });
+  // ----- screens -----
+  function show(which) {
+    $("auth").hidden = which !== "auth"; $("setup").hidden = which !== "setup"; $("app").hidden = which !== "app";
+    $("me").hidden = which === "auth";
+    if (which !== "app") { data = null; }
+  }
 
-  async function post(path, body) {
-    const r = await fetch("/api/" + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body || {}) });
+  async function token() { const { data: d } = await supa.auth.getSession(); return d && d.session ? d.session.access_token : null; }
+  async function api(path, opts = {}) {
+    const t = await token(); if (!t) { show("auth"); throw new Error("Please sign in"); }
+    const headers = { authorization: "Bearer " + t, ...(opts.body ? { "content-type": "application/json" } : {}) };
+    const r = await fetch("/api/" + path, { method: opts.method || "GET", headers, body: opts.body ? JSON.stringify(opts.body) : undefined, cache: "no-store" });
     const j = await r.json().catch(() => ({}));
-    if (r.status === 401 && path !== "login") { showAuth(); throw new Error("Please sign in again"); }
+    if (r.status === 401) { show("auth"); throw new Error("Please sign in again"); }
     if (!r.ok) throw new Error(j.error || "Request failed");
     return j;
   }
+  const post = (path, body) => api(path, { method: "POST", body: body || {} });
 
-  $("loginf").onsubmit = async e => {
-    e.preventDefault(); const m = $("loginmsg"); m.className = "msg"; m.textContent = "Signing in…";
-    try { await post("login", { identity: $("li").value, password: $("lp").value }); $("lp").value = ""; m.textContent = ""; firstLoad = true; await load(); }
+  $("linkf").onsubmit = async e => {
+    e.preventDefault(); const m = $("linkmsg"); m.className = "msg"; m.textContent = "Sending…"; $("linkbtn").disabled = true;
+    const email = $("email").value.trim().toLowerCase();
+    const { error } = await supa.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin + "/" } });
+    $("linkbtn").disabled = false;
+    if (error) { m.className = "msg err"; m.textContent = error.message; return; }
+    m.className = "msg ok"; m.textContent = "Link sent to " + email + ". Open it on this device to sign in. Check spam if it doesn't arrive within a minute.";
+  };
+
+  $("setupf").onsubmit = async e => {
+    e.preventDefault(); const m = $("setupmsg"); m.className = "msg"; m.textContent = "Saving…";
+    try { await post("profile", { name: $("rn").value, username: $("ru").value }); m.textContent = ""; firstLoad = true; await boot(); }
     catch (err) { m.className = "msg err"; m.textContent = err.message; }
   };
-  $("regf").onsubmit = async e => {
-    e.preventDefault(); const m = $("regmsg"); m.className = "msg"; m.textContent = "Creating your account…";
-    try { await post("register", { name: $("rn").value, username: $("ru").value, email: $("re").value, password: $("rp").value }); $("rp").value = ""; m.textContent = ""; firstLoad = true; await load(); }
-    catch (err) { m.className = "msg err"; m.textContent = err.message; }
-  };
-  $("logout").onclick = async () => { try { await post("logout"); } catch {} showAuth(); };
+
+  $("logout").onclick = async () => { try { await supa.auth.signOut(); } catch {} show("auth"); };
+
+  async function boot() {
+    const t = await token();
+    if (!t) { show("auth"); return; }
+    let who;
+    try { who = await api("me"); } catch { return; }
+    if (!who.user) { show("auth"); return; }
+    if (!who.profile) { $("setupemail").textContent = who.user.email; $("mename").textContent = who.user.email; show("setup"); return; }
+    await load();
+  }
+
+  supa.auth.onAuthStateChange((event) => {
+    if (event === "SIGNED_IN" || event === "INITIAL_SESSION") { if (!data) boot(); }
+    if (event === "SIGNED_OUT") show("auth");
+  });
 
   // ----- data -----
   const people = () => data.people;
   const byId = id => people().find(u => u.id === id);
-  const colorOf = id => (byId(id) || {}).color || "var(--muted)";
 
   async function load() {
-    const r = await fetch("/api/data", { cache: "no-store" });
-    if (r.status === 401) { showAuth(); return; }
-    if (!r.ok) throw new Error("load failed");
-    data = await r.json(); me = data.user;
+    data = await api("data"); me = data.user;
     person = byId(person ? person.id : savedPersonId) || people()[0];
-    showApp();
+    show("app");
     $("mename").textContent = me.name + " · @" + me.username;
     renderWho(); renderBuddies(); renderChart(); renderPBs(); renderRecent();
     if (firstLoad) { firstLoad = false; go(step); } else renderFlow();
@@ -501,7 +488,7 @@ const HTML = `<!doctype html>
   function renderWho() {
     $("who").innerHTML = people().map(u => '<button type="button" data-id="' + u.id + '" style="--p:' + u.color + '" aria-pressed="' + (u.id === person.id) + '">' + esc(u.name) + "</button>").join("");
     [...$("who").children].forEach(b => b.onclick = () => {
-      person = byId(Number(b.dataset.id));
+      person = byId(b.dataset.id);
       try { localStorage.setItem("gt_person", person.id); } catch {}
       $("liftmsg").className = "msg"; $("liftmsg").textContent = "";
       renderWho();
@@ -516,7 +503,7 @@ const HTML = `<!doctype html>
   function renderBuddies() {
     const f = data.friends; let h = "";
     if (f.incoming.length) h += "<h3>Requests for you</h3>" + f.incoming.map(u => brow(u, '<button class="mini go" type="button" data-a="accept" data-id="' + u.fid + '">Accept</button><button class="mini" type="button" data-a="remove" data-id="' + u.fid + '">Decline</button>')).join("");
-    h += "<h3>Your buddies</h3>" + (f.accepted.length ? f.accepted.map(u => brow(u, '<button class="mini" type="button" data-a="remove" data-id="' + u.fid + '">Remove</button>')).join("") : '<p class="empty">No buddies yet. Once they have registered, send a request with their username below.</p>');
+    h += "<h3>Your buddies</h3>" + (f.accepted.length ? f.accepted.map(u => brow(u, '<button class="mini" type="button" data-a="remove" data-id="' + u.fid + '">Remove</button>')).join("") : '<p class="empty">No buddies yet. Once they have signed in and set up a profile, send a request with their username below.</p>');
     if (f.outgoing.length) h += "<h3>Waiting on</h3>" + f.outgoing.map(u => brow(u, '<button class="mini" type="button" data-a="remove" data-id="' + u.fid + '">Cancel</button>')).join("");
     $("blist").innerHTML = h;
     const n = f.incoming.length;
@@ -623,8 +610,7 @@ const HTML = `<!doctype html>
 
   async function del(kind, ids, n) {
     if (!confirm(n > 1 ? "Delete these " + n + " sets?" : "Delete this entry?")) return;
-    const r = await fetch("/api/" + kind + "?ids=" + ids, { method: "DELETE" });
-    if (r.ok) load(); else alert("Could not delete.");
+    try { await api(kind + "?ids=" + ids, { method: "DELETE" }); await load(); } catch (e) { alert(e.message); }
   }
   $("recent").onclick = e => { const b = e.target.closest("button.del"); if (b) del(b.dataset.k, b.dataset.ids, Number(b.dataset.n)); };
 
@@ -673,7 +659,7 @@ const HTML = `<!doctype html>
     $("recent").innerHTML = h + "</table>";
   }
 
-  load().catch(() => { document.querySelector("main").insertAdjacentHTML("afterbegin", '<p class="msg err">Could not reach the server. Try again in a moment.</p>'); });
+  boot().catch(() => { document.querySelector("main").insertAdjacentHTML("afterbegin", '<p class="msg err">Could not reach the server. Try again in a moment.</p>'); });
 })();
 </script>
 </body>
