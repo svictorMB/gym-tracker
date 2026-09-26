@@ -2,7 +2,7 @@
 // Reads SUPABASE_URL / SUPABASE_SERVICE_KEY from .dev.vars (or the environment).
 // Rows are inserted with user_id NULL and attach to accounts when people set up their profile.
 // Usage: node scripts/migrate-from-d1.mjs [--dry-run]
-import { execFileSync } from "node:child_process";
+import { join } from "node:path";
 import { readFileSync, existsSync } from "node:fs";
 
 const dry = process.argv.includes("--dry-run");
@@ -15,9 +15,20 @@ if (existsSync(".dev.vars")) {
 const { SUPABASE_URL, SUPABASE_SERVICE_KEY } = env;
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) { console.error("Need SUPABASE_URL and SUPABASE_SERVICE_KEY in .dev.vars or the environment"); process.exit(1); }
 
-function d1(sql) {
-  const out = execFileSync("npx", ["wrangler", "d1", "execute", "gym-tracker", "--remote", "--json", "--command", sql], { encoding: "utf8", shell: process.platform === "win32" });
-  return JSON.parse(out)[0].results;
+const D1_ACCOUNT = "8e2129b11a7145938453143ccd3f1ec8", D1_ID = "1f58662c-18fc-458e-8bed-6c8ef7b45832";
+function cfToken() {
+  if (process.env.CLOUDFLARE_API_TOKEN) return process.env.CLOUDFLARE_API_TOKEN;
+  const cfg = join(process.env.APPDATA || "", "xdg.config", ".wrangler", "config", "default.toml");
+  const m = existsSync(cfg) && readFileSync(cfg, "utf8").match(/^oauth_token\s*=\s*"([^"]+)"/m);
+  if (!m) throw new Error("Run npx wrangler login first (or set CLOUDFLARE_API_TOKEN)");
+  return m[1];
+}
+async function d1(sql) {
+  const r = await fetch("https://api.cloudflare.com/client/v4/accounts/" + D1_ACCOUNT + "/d1/database/" + D1_ID + "/query", {
+    method: "POST", headers: { authorization: "Bearer " + cfToken(), "content-type": "application/json" }, body: JSON.stringify({ sql }) });
+  const j = await r.json();
+  if (!j.success) throw new Error("D1: " + JSON.stringify(j.errors));
+  return j.result[0].results;
 }
 async function sb(path, opts = {}) {
   const r = await fetch(SUPABASE_URL + "/rest/v1/" + path, {
@@ -30,11 +41,10 @@ async function sb(path, opts = {}) {
   return text ? JSON.parse(text) : null;
 }
 
-const lifts = d1("SELECT person, date, workout, exercise, weight, reps, created_at FROM lifts ORDER BY id");
-const weights = d1("SELECT person, date, lbs, created_at FROM weights ORDER BY id");
+const lifts = await d1("SELECT person, date, workout, exercise, weight, reps, created_at FROM lifts ORDER BY id");
+const weights = await d1("SELECT person, date, lbs, created_at FROM weights ORDER BY id");
 console.log("D1 has", lifts.length, "lifts and", weights.length, "weigh-ins");
 
-const existing = await sb("lifts?select=id&limit=1", { prefer: "count=exact" });
 const already = (await sb("lifts?select=id", { prefer: "" })).length + (await sb("weights?select=id", { prefer: "" })).length;
 if (already) { console.error("Supabase already has", already, "rows; refusing to import twice. Empty the tables first if you really want to re-run."); process.exit(1); }
 if (dry) { console.log("Dry run: nothing written."); process.exit(0); }
