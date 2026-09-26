@@ -24,7 +24,7 @@ npm run dev
 ```
 
 ## Attaching the old logs
-Rows logged before accounts existed have `user_id = NULL` and a `person` name. After that person registers, attach their rows (replace the username and name):
+Rows logged before accounts existed have `user_id = NULL` and a `person` name. The `LEGACY` map in `src/index.js` lists the three original emails: when one of them registers, their old rows attach automatically and they become buddies with the other two. For anyone else, attach rows by hand (replace the username and name):
 ```
 npx wrangler d1 execute gym-tracker --remote --command "UPDATE lifts SET user_id = (SELECT id FROM users WHERE username = 'sam') WHERE user_id IS NULL AND person = 'Sam'; UPDATE weights SET user_id = (SELECT id FROM users WHERE username = 'sam') WHERE user_id IS NULL AND person = 'Sam';"
 ```

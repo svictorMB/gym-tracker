@@ -23,6 +23,14 @@ const CUES = {
   "Dead bug (reps per side)": "Lower back pressed into the floor. Extend the opposite arm and leg, exhale as you extend, alternate sides.",
 };
 
+// Logs saved before accounts existed are attached to whoever registers with these emails,
+// and these three are made buddies with each other automatically.
+const LEGACY = {
+  "samueldavidson@gmail.com": "Sam",
+  "selvakumar.victor@gmail.com": "Selva",
+  "g.ebenezer.thomas@gmail.com": "Ebe",
+};
+
 const PALETTE = ["#1F4FD8", "#D9772B", "#1E8E55", "#8E44AD", "#C2185B", "#00838F", "#6D4C41", "#455A64"];
 const SESSION_DAYS = 90;
 const PBKDF2_ITERATIONS = 100000;
@@ -132,7 +140,18 @@ async function api(request, env, url) {
     const pass_hash = await hashPassword(password, salt);
     const ins = await env.DB.prepare("INSERT INTO users (email, username, name, pass_hash, salt) VALUES (?, ?, ?, ?, ?)")
       .bind(email, username, name, pass_hash, salt).run();
-    return startSession(env, { id: ins.meta.last_row_id, email, username, name }, url);
+    const uid = ins.meta.last_row_id;
+    if (LEGACY[email]) {
+      const legacyName = LEGACY[email];
+      const crew = Object.keys(LEGACY).filter(e => e !== email);
+      const others = await env.DB.prepare(`SELECT id FROM users WHERE email IN (${crew.map(() => "?").join(",")})`).bind(...crew).all();
+      await env.DB.batch([
+        env.DB.prepare("UPDATE lifts SET user_id = ? WHERE user_id IS NULL AND person = ?").bind(uid, legacyName),
+        env.DB.prepare("UPDATE weights SET user_id = ? WHERE user_id IS NULL AND person = ?").bind(uid, legacyName),
+        ...others.results.map(o => env.DB.prepare("INSERT OR IGNORE INTO friendships (requester_id, addressee_id, status) VALUES (?, ?, ?)").bind(uid, o.id, "accepted")),
+      ]);
+    }
+    return startSession(env, { id: uid, email, username, name }, url);
   }
 
   if (method === "POST" && path === "login") {
