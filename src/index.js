@@ -54,10 +54,24 @@ async function api(request, env, url) {
     return json({ ok: true });
   }
 
+  if (request.method === "POST" && path === "lifts") {
+    const b = await request.json();
+    const raw = Array.isArray(b.sets) ? b.sets : [];
+    const sets = raw.filter(x => x && (String(x.weight ?? "").trim() !== "" || String(x.reps ?? "").trim() !== ""))
+                    .map(x => ({ weight: Number(x.weight), reps: Number(x.reps) }));
+    const valid = PEOPLE.includes(b.person) && b.date && WORKOUTS[b.workout]?.includes(b.exercise)
+      && sets.length > 0 && sets.every(x => x.weight >= 0 && x.reps > 0);
+    if (!valid) return json({ error: "Need a name, date, exercise and at least one set with weight and reps" }, 400);
+    const stmt = env.DB.prepare("INSERT INTO lifts (person, date, workout, exercise, weight, reps) VALUES (?, ?, ?, ?, ?, ?)");
+    await env.DB.batch(sets.map(x => stmt.bind(b.person, b.date, b.workout, b.exercise, x.weight, x.reps)));
+    return json({ ok: true, saved: sets.length });
+  }
+
   if (request.method === "DELETE" && (path === "weight" || path === "lift")) {
-    const id = Number(url.searchParams.get("id"));
-    if (!id) return json({ error: "Missing id" }, 400);
-    await env.DB.prepare(`DELETE FROM ${path === "weight" ? "weights" : "lifts"} WHERE id = ?`).bind(id).run();
+    const ids = (url.searchParams.get("ids") || url.searchParams.get("id") || "").split(",").map(Number).filter(n => Number.isInteger(n) && n > 0);
+    if (!ids.length) return json({ error: "Missing id" }, 400);
+    const table = path === "weight" ? "weights" : "lifts";
+    await env.DB.prepare(`DELETE FROM ${table} WHERE id IN (${ids.map(() => "?").join(",")})`).bind(...ids).run();
     return json({ ok: true });
   }
 
@@ -115,12 +129,16 @@ const HTML = `<!doctype html>
   .pin input{flex:1}
   .pin button{padding:0 16px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);cursor:pointer}
   details summary{cursor:pointer;color:var(--muted);font-size:14px;margin-top:10px}
+  .sets{display:grid;gap:8px;margin-top:12px}
+  .set{display:grid;grid-template-columns:52px 1fr 1fr;gap:8px;align-items:center}
+  .set .setn,.set label{font-size:13px;color:var(--muted);margin:0}
+  .hint{font-size:13px;color:var(--muted);margin:8px 0 0}
 </style>
 </head>
 <body>
 <main>
   <h1>Gym Tracker</h1>
-  <p class="sub">Log weigh-ins and best sets. Everyone sees everyone.</p>
+  <p class="sub">Log weigh-ins and your sets. Everyone sees everyone.</p>
 
   <div class="who" id="who"></div>
   <div id="pinbox" class="pin" hidden>
@@ -135,11 +153,14 @@ const HTML = `<!doctype html>
       <div><label for="workout">Workout</label><select id="workout"><option>A</option><option>B</option></select></div>
     </div>
     <div class="row"><div><label for="exercise">Exercise</label><select id="exercise"></select></div></div>
-    <div class="row">
-      <div><label for="lw">Weight (lbs, 0 for bodyweight)</label><input id="lw" type="number" inputmode="decimal" min="0" step="2.5"></div>
-      <div><label for="lr">Reps or seconds</label><input id="lr" type="number" inputmode="numeric" min="1"></div>
+    <div class="sets" id="sets">
+      <div class="set"><span></span><label>Weight (lbs)</label><label>Reps or seconds</label></div>
+      <div class="set"><span class="setn">Set 1</span><input class="sw" type="number" inputmode="decimal" min="0" step="2.5" aria-label="Set 1 weight"><input class="sr" type="number" inputmode="numeric" min="1" aria-label="Set 1 reps"></div>
+      <div class="set"><span class="setn">Set 2</span><input class="sw" type="number" inputmode="decimal" min="0" step="2.5" aria-label="Set 2 weight"><input class="sr" type="number" inputmode="numeric" min="1" aria-label="Set 2 reps"></div>
+      <div class="set"><span class="setn">Set 3</span><input class="sw" type="number" inputmode="decimal" min="0" step="2.5" aria-label="Set 3 weight"><input class="sr" type="number" inputmode="numeric" min="1" aria-label="Set 3 reps"></div>
     </div>
-    <button class="save" id="liftsave" type="button">Save set</button>
+    <p class="hint">Use 0 lbs for bodyweight. Leave a set blank to skip it. Values stay filled after saving, so tap the next person, adjust, and save again.</p>
+    <button class="save" id="liftsave" type="button">Save sets</button>
     <div class="msg" id="liftmsg"></div>
   </div>
 
@@ -185,7 +206,7 @@ const HTML = `<!doctype html>
 
   function renderWho() {
     $("who").innerHTML = PEOPLE().map(p => '<button type="button" style="--p:' + colors[p] + '" aria-pressed="' + (p === person) + '">' + p + "</button>").join("");
-    [...$("who").children].forEach((b, i) => b.onclick = () => { person = PEOPLE()[i]; try { localStorage.setItem("gt_person", person); } catch {} renderWho(); });
+    [...$("who").children].forEach((b, i) => b.onclick = () => { person = PEOPLE()[i]; try { localStorage.setItem("gt_person", person); } catch {} $("liftmsg").className = "msg"; $("liftmsg").textContent = ""; renderWho(); });
   }
 
   function fillExercises() {
@@ -206,14 +227,18 @@ const HTML = `<!doctype html>
   }
 
   $("liftsave").onclick = async () => {
-    const body = { person, date: $("ldate").value, workout: $("workout").value, exercise: $("exercise").value, weight: Number($("lw").value), reps: Number($("lr").value) };
+    const sets = [...document.querySelectorAll("#sets .set")]
+      .filter(r => r.querySelector(".sw"))
+      .map(r => ({ weight: r.querySelector(".sw").value.trim(), reps: r.querySelector(".sr").value.trim() }))
+      .filter(x => x.weight !== "" || x.reps !== "");
+    const body = { person, date: $("ldate").value, workout: $("workout").value, exercise: $("exercise").value, sets };
     const prev = bestFor(person, body.exercise);
     const m = $("liftmsg"); m.className = "msg"; m.textContent = "Saving…"; $("liftsave").disabled = true;
     try {
-      await post("lift", body); await load();
-      const isPB = !prev || body.weight > prev.weight || (body.weight === prev.weight && body.reps > prev.reps);
-      m.className = isPB ? "msg pb" : "msg"; m.textContent = isPB ? "New personal best!" : "Saved.";
-      $("lw").value = ""; $("lr").value = "";
+      const r = await post("lifts", body); await load();
+      const isPB = sets.some(x => { const w = Number(x.weight), rp = Number(x.reps); return !prev || w > prev.weight || (w === prev.weight && rp > prev.reps); });
+      m.className = isPB ? "msg pb" : "msg";
+      m.textContent = (isPB ? "New personal best! " : "") + "Saved " + r.saved + (r.saved === 1 ? " set" : " sets") + " for " + person + ". Tap the next person to log theirs.";
     } catch (e) { m.className = "msg err"; m.textContent = e.message; }
     $("liftsave").disabled = false;
   };
@@ -225,9 +250,9 @@ const HTML = `<!doctype html>
     $("wsave").disabled = false;
   };
 
-  async function del(kind, id) {
-    if (!confirm("Delete this entry?")) return;
-    const r = await fetch("/api/" + kind + "?id=" + id, { method: "DELETE", headers: headers() });
+  async function del(kind, ids, n) {
+    if (!confirm(n > 1 ? "Delete these " + n + " sets?" : "Delete this entry?")) return;
+    const r = await fetch("/api/" + kind + "?ids=" + ids, { method: "DELETE", headers: headers() });
     if (r.ok) load(); else alert("Could not delete (check PIN).");
   }
   window.gtDel = del;
@@ -261,12 +286,17 @@ const HTML = `<!doctype html>
   }
 
   function renderRecent() {
-    const L = data.lifts.slice(0, 25), W = data.weights.slice(-10).reverse();
+    const groups = [];
+    for (const l of data.lifts) {
+      const g = groups.find(x => x.d === l.date && x.p === l.person && x.ex === l.exercise);
+      if (g) g.sets.push(l); else groups.push({ d: l.date, p: l.person, ex: l.exercise, sets: [l] });
+    }
+    const L = groups.slice(0, 25), W = data.weights.slice(-10).reverse();
     if (!L.length && !W.length) { $("recent").innerHTML = '<p class="empty">Nothing logged yet.</p>'; return; }
     let h = "<table><tr><th>Date</th><th>Who</th><th>What</th><th></th></tr>";
-    const rows = [...L.map(l => ({ d: l.date, p: l.person, t: l.exercise + " " + l.weight + " × " + l.reps, k: "lift", id: l.id })),
-                  ...W.map(w => ({ d: w.date, p: w.person, t: "Weigh-in " + w.lbs + " lb", k: "weight", id: w.id }))].sort((a, b) => b.d.localeCompare(a.d) || b.id - a.id).slice(0, 30);
-    rows.forEach(r => h += '<tr><td class="n">' + r.d + '</td><td class="n"><i class="chip" style="background:' + colors[r.p] + '"></i>' + r.p + "</td><td>" + r.t + '</td><td><button class="del" type="button" onclick="gtDel(\\'' + r.k + "'," + r.id + ')">Delete</button></td></tr>');
+    const rows = [...L.map(g => { const ss = g.sets.slice().sort((a, b) => a.id - b.id); return { d: g.d, p: g.p, t: g.ex + " " + ss.map(x => x.weight + "×" + x.reps).join(", "), k: "lift", id: ss[ss.length - 1].id, ids: ss.map(x => x.id).join(","), n: ss.length }; }),
+                  ...W.map(w => ({ d: w.date, p: w.person, t: "Weigh-in " + w.lbs + " lb", k: "weight", id: w.id, ids: String(w.id), n: 1 }))].sort((a, b) => b.d.localeCompare(a.d) || b.id - a.id).slice(0, 30);
+    rows.forEach(r => h += '<tr><td class="n">' + r.d + '</td><td class="n"><i class="chip" style="background:' + colors[r.p] + '"></i>' + r.p + "</td><td>" + r.t + '</td><td><button class="del" type="button" onclick="gtDel(\\'' + r.k + "\\',\\'" + r.ids + "\\'," + r.n + ')">Delete</button></td></tr>');
     $("recent").innerHTML = h + "</table>";
   }
 
