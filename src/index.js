@@ -8,6 +8,21 @@ const WORKOUTS = {
   B: ["Goblet squat", "Lat pulldown", "Incline dumbbell press", "Seated leg curl", "Cable face pull", "Dead bug (reps per side)"],
 };
 
+const CUES = {
+  "Leg press": "Feet shoulder-width on the plate. Lower until the knees are near 90°, press back up without locking out.",
+  "Chest press machine": "Handles level with mid-chest. Press smoothly and control the return; don't let the stack slam.",
+  "Seated cable row": "Sit tall, pull the handle to your stomach and squeeze the shoulder blades together, then return slowly.",
+  "Dumbbell Romanian deadlift": "Soft knees, hinge at the hips with a flat back, dumbbells close to the legs, stand up by squeezing the glutes.",
+  "Seated shoulder press machine": "Press up without shrugging the shoulders. Stop just short of locking the elbows.",
+  "Plank (seconds)": "Straight line from head to heels, squeeze the glutes, keep breathing. Log the seconds held as reps.",
+  "Goblet squat": "Hold the dumbbell at your chest, sit down between the knees with the chest up, drive through the heels.",
+  "Lat pulldown": "Lean back slightly, pull the bar to the upper chest with the elbows down, control it back up.",
+  "Incline dumbbell press": "Bench at about 30°. Lower the dumbbells to chest level, press up and slightly inward.",
+  "Seated leg curl": "Pad just above the ankles. Curl all the way, then return slowly without letting the stack drop.",
+  "Cable face pull": "Rope at face height. Pull toward the forehead with the elbows high, squeeze the rear shoulders.",
+  "Dead bug (reps per side)": "Lower back pressed into the floor. Extend the opposite arm and leg, exhale as you extend, alternate sides.",
+};
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -33,7 +48,7 @@ async function api(request, env, url) {
       env.DB.prepare("SELECT id, person, date, lbs FROM weights ORDER BY date ASC, id ASC").all(),
       env.DB.prepare("SELECT id, person, date, workout, exercise, weight, reps FROM lifts ORDER BY date DESC, id DESC").all(),
     ]);
-    return json({ people: PEOPLE, workouts: WORKOUTS, weights: weights.results, lifts: lifts.results, pinRequired: !!env.PIN });
+    return json({ people: PEOPLE, workouts: WORKOUTS, cues: CUES, weights: weights.results, lifts: lifts.results, pinRequired: !!env.PIN });
   }
 
   if (!authorized(request, env)) return json({ error: "Wrong PIN" }, 401);
@@ -63,7 +78,8 @@ async function api(request, env, url) {
       && sets.length > 0 && sets.every(x => x.weight >= 0 && x.reps > 0);
     if (!valid) return json({ error: "Need a name, date, exercise and at least one set with weight and reps" }, 400);
     const stmt = env.DB.prepare("INSERT INTO lifts (person, date, workout, exercise, weight, reps) VALUES (?, ?, ?, ?, ?, ?)");
-    await env.DB.batch(sets.map(x => stmt.bind(b.person, b.date, b.workout, b.exercise, x.weight, x.reps)));
+    const clear = env.DB.prepare("DELETE FROM lifts WHERE person = ? AND date = ? AND exercise = ?").bind(b.person, b.date, b.exercise);
+    await env.DB.batch([clear, ...sets.map(x => stmt.bind(b.person, b.date, b.workout, b.exercise, x.weight, x.reps))]);
     return json({ ok: true, saved: sets.length });
   }
 
@@ -126,6 +142,7 @@ const HTML = `<!doctype html>
   svg{width:100%;height:auto;display:block}
   .legend{display:flex;gap:14px;font-size:14px;margin-top:6px;color:var(--muted)}
   .pin{display:flex;gap:8px;margin:10px 0 0}
+  .pin[hidden]{display:none}
   .pin input{flex:1}
   .pin button{padding:0 16px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);cursor:pointer}
   details summary{cursor:pointer;color:var(--muted);font-size:14px;margin-top:10px}
@@ -133,6 +150,27 @@ const HTML = `<!doctype html>
   .set{display:grid;grid-template-columns:52px 1fr 1fr;gap:8px;align-items:center}
   .set .setn,.set label{font-size:13px;color:var(--muted);margin:0}
   .hint{font-size:13px;color:var(--muted);margin:8px 0 0}
+  .seg{display:flex;gap:6px}
+  .seg button{flex:1;padding:10px 0;border:2px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);font-size:16px;font-weight:600;cursor:pointer}
+  .seg button[aria-pressed=true]{border-color:var(--accent);color:var(--accent)}
+  .steps{list-style:none;margin:14px 0 0;padding:0;display:grid;gap:6px}
+  .steps button{width:100%;display:flex;align-items:center;gap:10px;padding:9px 10px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);font-size:15px;text-align:left;cursor:pointer}
+  .steps .active button{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+  .tick{flex:none;width:24px;height:24px;border-radius:50%;border:1px solid var(--line);display:grid;place-items:center;font-size:12px;font-weight:600;color:var(--muted)}
+  .steps .done .tick{background:var(--pb);border-color:var(--pb);color:#fff}
+  .nm{flex:1;min-width:0}
+  .nm small{display:block;color:var(--muted);font-size:12px}
+  .whos{flex:none}
+  .whos .chip{margin:0 0 0 3px}
+  .current{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+  .stepn{font-size:13px;color:var(--muted)}
+  .exname{font-size:20px;font-weight:700;margin:2px 0 4px}
+  .cue{font-size:14px;color:var(--muted);margin:0 0 6px}
+  .last{font-size:14px;margin:0}
+  .nav{display:flex;gap:8px;margin-top:10px}
+  .nav button{flex:1;padding:11px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);font-size:15px;cursor:pointer}
+  .nav button:disabled{opacity:.4}
+  .finished{margin-top:14px;padding:14px;border-radius:10px;background:var(--bg);font-size:15px}
 </style>
 </head>
 <body>
@@ -146,22 +184,30 @@ const HTML = `<!doctype html>
     <button id="pinsave" type="button">Remember</button>
   </div>
 
-  <h2>Log a set</h2>
+  <h2>Today's workout</h2>
   <div class="panel">
     <div class="row">
       <div><label for="ldate">Date</label><input id="ldate" type="date"></div>
-      <div><label for="workout">Workout</label><select id="workout"><option>A</option><option>B</option></select></div>
+      <div><label>Workout</label><div class="seg" id="wsel"><button type="button" data-w="A">A</button><button type="button" data-w="B">B</button></div></div>
     </div>
-    <div class="row"><div><label for="exercise">Exercise</label><select id="exercise"></select></div></div>
+    <ol class="steps" id="steps" aria-label="Exercises in this workout"></ol>
+    <div class="current" id="entry">
+    <div class="stepn" id="stepn"></div>
+    <div class="exname" id="exname"></div>
+    <p class="cue" id="cue"></p>
+    <p class="last" id="last"></p>
     <div class="sets" id="sets">
       <div class="set"><span></span><label>Weight (lbs)</label><label>Reps or seconds</label></div>
       <div class="set"><span class="setn">Set 1</span><input class="sw" type="number" inputmode="decimal" min="0" step="2.5" aria-label="Set 1 weight"><input class="sr" type="number" inputmode="numeric" min="1" aria-label="Set 1 reps"></div>
       <div class="set"><span class="setn">Set 2</span><input class="sw" type="number" inputmode="decimal" min="0" step="2.5" aria-label="Set 2 weight"><input class="sr" type="number" inputmode="numeric" min="1" aria-label="Set 2 reps"></div>
       <div class="set"><span class="setn">Set 3</span><input class="sw" type="number" inputmode="decimal" min="0" step="2.5" aria-label="Set 3 weight"><input class="sr" type="number" inputmode="numeric" min="1" aria-label="Set 3 reps"></div>
     </div>
-    <p class="hint">Use 0 lbs for bodyweight. Leave a set blank to skip it. Values stay filled after saving, so tap the next person, adjust, and save again.</p>
+    <p class="hint">Use 0 lbs for bodyweight. Leave a set blank to skip it. Rows prefill from your last time. After saving, tap the next person: their own last numbers load if they have any, otherwise yours carry over. Saving again for the same person replaces their sets for this exercise today.</p>
     <button class="save" id="liftsave" type="button">Save sets</button>
     <div class="msg" id="liftmsg"></div>
+    <div class="nav"><button type="button" id="prev">← Back</button><button type="button" id="next">Next exercise →</button></div>
+    </div>
+    <div class="finished" id="finished" hidden></div>
   </div>
 
   <h2>Weigh in</h2>
@@ -193,6 +239,12 @@ const HTML = `<!doctype html>
   try { person = localStorage.getItem("gt_person"); pin = localStorage.getItem("gt_pin") || ""; } catch {}
   const today = new Date().toISOString().slice(0, 10);
   $("ldate").value = today; $("wdate").value = today;
+  let workout = "A", step = 0, firstLoad = true;
+  try {
+    if (["A", "B"].includes(localStorage.getItem("gt_workout"))) workout = localStorage.getItem("gt_workout");
+    const s = localStorage.getItem("gt_step") || "";
+    if (s.startsWith(today + ":")) step = Number(s.slice(today.length + 1)) || 0;
+  } catch {}
 
   function headers() { const h = { "content-type": "application/json" }; if (pin) h["x-pin"] = pin; return h; }
 
@@ -200,20 +252,73 @@ const HTML = `<!doctype html>
     const r = await fetch("/api/data"); data = await r.json();
     if (!PEOPLE().includes(person)) person = PEOPLE()[0];
     $("pinbox").hidden = !data.pinRequired; $("pin").value = pin;
-    renderWho(); fillExercises(); renderChart(); renderPBs(); renderRecent();
+    renderWho(); renderChart(); renderPBs(); renderRecent();
+    if (firstLoad) { firstLoad = false; go(step); } else renderFlow();
   }
   const PEOPLE = () => data.people;
 
   function renderWho() {
     $("who").innerHTML = PEOPLE().map(p => '<button type="button" style="--p:' + colors[p] + '" aria-pressed="' + (p === person) + '">' + p + "</button>").join("");
-    [...$("who").children].forEach((b, i) => b.onclick = () => { person = PEOPLE()[i]; try { localStorage.setItem("gt_person", person); } catch {} $("liftmsg").className = "msg"; $("liftmsg").textContent = ""; renderWho(); });
+    [...$("who").children].forEach((b, i) => b.onclick = () => { person = PEOPLE()[i]; try { localStorage.setItem("gt_person", person); } catch {} $("liftmsg").className = "msg"; $("liftmsg").textContent = ""; renderWho(); const ex = EX()[step]; if (ex && (setsToday(person, ex).length || lastTime(person, ex))) fillFromHistory(); renderFlow(); });
   }
 
-  function fillExercises() {
-    const w = $("workout").value;
-    $("exercise").innerHTML = data.workouts[w].map(e => "<option>" + e + "</option>").join("");
+  const EX = () => data.workouts[workout];
+  const fmt = ss => ss.map(x => x.weight + "×" + x.reps).join(", ");
+  function setsToday(p, ex) { const d = $("ldate").value; return data.lifts.filter(l => l.person === p && l.exercise === ex && l.date === d).sort((a, b) => a.id - b.id); }
+  function lastTime(p, ex) {
+    const d = $("ldate").value, prior = data.lifts.filter(l => l.person === p && l.exercise === ex && l.date < d);
+    if (!prior.length) return null;
+    const date = prior[0].date;
+    return { date, sets: prior.filter(l => l.date === date).sort((a, b) => a.id - b.id) };
   }
-  $("workout").onchange = fillExercises;
+  function remember() { try { localStorage.setItem("gt_workout", workout); localStorage.setItem("gt_step", today + ":" + step); } catch {} }
+  function setRows() { return [...document.querySelectorAll("#sets .set")].filter(r => r.querySelector(".sw")); }
+
+  function fillFromHistory() {
+    const ex = EX()[step]; if (!ex) return;
+    const mine = setsToday(person, ex), lt = lastTime(person, ex);
+    const src = mine.length ? mine : (lt ? lt.sets : []);
+    setRows().forEach((r, i) => { r.querySelector(".sw").value = src[i] ? src[i].weight : ""; r.querySelector(".sr").value = src[i] ? src[i].reps : ""; });
+  }
+
+  function go(i) {
+    step = Math.max(0, Math.min(i, EX().length));
+    fillFromHistory();
+    $("liftmsg").className = "msg"; $("liftmsg").textContent = "";
+    renderFlow();
+    if (step < EX().length) $("entry").scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
+
+  function renderFlow() {
+    [...$("wsel").children].forEach(b => b.setAttribute("aria-pressed", b.dataset.w === workout));
+    const ex = EX(), n = ex.length;
+    if (step > n) step = n;
+    $("steps").innerHTML = ex.map((e, i) => {
+      const mine = setsToday(person, e);
+      const who = PEOPLE().filter(p => setsToday(p, e).length).map(p => '<i class="chip" style="background:' + colors[p] + '" title="' + p + '"></i>').join("");
+      return '<li class="' + (i === step ? "active" : "") + (mine.length ? " done" : "") + '"><button type="button" data-i="' + i + '" aria-current="' + (i === step) + '"><span class="tick">' + (mine.length ? "✓" : i + 1) + '</span><span class="nm">' + e + (mine.length ? "<small>" + fmt(mine) + "</small>" : "") + '</span><span class="whos">' + who + "</span></button></li>";
+    }).join("");
+    [...$("steps").querySelectorAll("button")].forEach(b => b.onclick = () => go(Number(b.dataset.i)));
+    const done = step >= n;
+    $("entry").hidden = done; $("finished").hidden = !done;
+    if (done) {
+      const count = ex.filter(e => setsToday(person, e).length).length;
+      $("finished").innerHTML = "<strong>Workout " + workout + " done.</strong> " + person + " logged " + count + " of " + n + " exercises today. Tap any exercise above to add or fix sets.";
+    } else {
+      $("stepn").textContent = "Exercise " + (step + 1) + " of " + n;
+      $("exname").textContent = ex[step];
+      $("cue").textContent = (data.cues || {})[ex[step]] || "";
+      const lt = lastTime(person, ex[step]), mine = setsToday(person, ex[step]);
+      $("last").textContent = mine.length ? person + " today: " + fmt(mine) : lt ? person + " last time (" + lt.date + "): " + fmt(lt.sets) : "First time logging this one for " + person + ".";
+      $("next").textContent = step === n - 1 ? "Finish workout ✓" : "Next exercise →";
+      $("prev").disabled = step === 0;
+    }
+    remember();
+  }
+  [...$("wsel").children].forEach(b => b.onclick = () => { if (workout !== b.dataset.w) { workout = b.dataset.w; go(0); } });
+  $("next").onclick = () => go(step + 1);
+  $("prev").onclick = () => go(step - 1);
+  $("ldate").onchange = () => go(step);
 
   $("pinsave").onclick = () => { pin = $("pin").value.trim(); try { localStorage.setItem("gt_pin", pin); } catch {} };
 
@@ -227,18 +332,18 @@ const HTML = `<!doctype html>
   }
 
   $("liftsave").onclick = async () => {
-    const sets = [...document.querySelectorAll("#sets .set")]
-      .filter(r => r.querySelector(".sw"))
+    const sets = setRows()
       .map(r => ({ weight: r.querySelector(".sw").value.trim(), reps: r.querySelector(".sr").value.trim() }))
       .filter(x => x.weight !== "" || x.reps !== "");
-    const body = { person, date: $("ldate").value, workout: $("workout").value, exercise: $("exercise").value, sets };
+    const body = { person, date: $("ldate").value, workout, exercise: EX()[step], sets };
+    if (!body.exercise) return;
     const prev = bestFor(person, body.exercise);
     const m = $("liftmsg"); m.className = "msg"; m.textContent = "Saving…"; $("liftsave").disabled = true;
     try {
       const r = await post("lifts", body); await load();
       const isPB = sets.some(x => { const w = Number(x.weight), rp = Number(x.reps); return !prev || w > prev.weight || (w === prev.weight && rp > prev.reps); });
       m.className = isPB ? "msg pb" : "msg";
-      m.textContent = (isPB ? "New personal best! " : "") + "Saved " + r.saved + (r.saved === 1 ? " set" : " sets") + " for " + person + ". Tap the next person to log theirs.";
+      m.textContent = (isPB ? "New personal best! " : "") + "Saved " + r.saved + (r.saved === 1 ? " set" : " sets") + " for " + person + ". Tap the next person to log theirs, or Next exercise.";
     } catch (e) { m.className = "msg err"; m.textContent = e.message; }
     $("liftsave").disabled = false;
   };
