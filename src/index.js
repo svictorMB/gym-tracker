@@ -309,6 +309,10 @@ const HTML = `<!doctype html>
   .nav button{flex:1;padding:11px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);font-size:15px;cursor:pointer}
   .nav button:disabled{opacity:.4}
   .finished{margin-top:14px;padding:14px;border-radius:10px;background:var(--bg);font-size:15px}
+  .tabbar{position:sticky;top:0;z-index:5;display:flex;gap:4px;margin:12px -16px 4px;padding:8px 16px 0;background:var(--bg);border-bottom:1px solid var(--line)}
+  .tabbar button{flex:1;padding:10px 2px 9px;border:0;border-bottom:3px solid transparent;background:none;color:var(--muted);font-size:15px;font-weight:600;cursor:pointer;white-space:nowrap}
+  .tabbar button[aria-selected=true]{color:var(--accent);border-bottom-color:var(--accent)}
+  section.tab>h2:first-child{margin-top:16px}
   [hidden]{display:none !important}
 </style>
 </head>
@@ -349,6 +353,14 @@ const HTML = `<!doctype html>
       </div>
     </details>
 
+    <nav class="tabbar" id="tabbar" aria-label="Sections">
+      <button type="button" data-tab="workout" role="tab">Workout</button>
+      <button type="button" data-tab="weigh" role="tab">Weigh in</button>
+      <button type="button" data-tab="bests" role="tab">Bests</button>
+      <button type="button" data-tab="recent" role="tab">Recent</button>
+    </nav>
+
+    <section class="tab" data-tab="workout">
     <h2>Today's workout</h2>
     <div class="panel">
       <div class="row" style="margin-top:0">
@@ -374,7 +386,9 @@ const HTML = `<!doctype html>
       </div>
       <div class="finished" id="finished" hidden></div>
     </div>
+    </section>
 
+    <section class="tab" data-tab="weigh" hidden>
     <h2>Weigh in</h2>
     <div class="panel">
       <div class="row" style="margin-top:0">
@@ -387,12 +401,17 @@ const HTML = `<!doctype html>
 
     <h2>Weight over time</h2>
     <div class="panel" id="chart"><p class="empty">No weigh-ins yet. The chart appears after the first one.</p></div>
+    </section>
 
+    <section class="tab" data-tab="bests" hidden>
     <h2>Personal bests</h2>
     <div class="panel wrap" id="pbs"></div>
+    </section>
 
+    <section class="tab" data-tab="recent" hidden>
     <h2>Recent sets</h2>
     <div class="panel wrap" id="recent"></div>
+    </section>
   </div>
 </main>
 
@@ -420,6 +439,18 @@ const HTML = `<!doctype html>
   }
   // Implicit flow so the emailed link works even when it opens in a different browser than the one that requested it.
   const supa = window.supabase.createClient(SB.url, SB.anonKey, { auth: { flowType: "implicit", persistSession: true, autoRefreshToken: true, detectSessionInUrl: true } });
+
+  // ----- tabs -----
+  let tab = "workout";
+  try { const t = localStorage.getItem("gt_tab"); if (["workout", "weigh", "bests", "recent"].includes(t)) tab = t; } catch {}
+  function showTab(t) {
+    tab = t;
+    [...document.querySelectorAll("section.tab")].forEach(sec => sec.hidden = sec.dataset.tab !== t);
+    [...$("tabbar").children].forEach(b => b.setAttribute("aria-selected", b.dataset.tab === t));
+    try { localStorage.setItem("gt_tab", t); } catch {}
+  }
+  [...$("tabbar").children].forEach(b => b.onclick = () => showTab(b.dataset.tab));
+  showTab(tab);
 
   // ----- screens -----
   function show(which) {
@@ -546,7 +577,7 @@ const HTML = `<!doctype html>
     fillFromHistory();
     $("liftmsg").className = "msg"; $("liftmsg").textContent = "";
     renderFlow();
-    if (step < EX().length) $("entry").scrollIntoView({ block: "nearest", behavior: "smooth" });
+    if (step < EX().length && tab === "workout") $("entry").scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
 
   function renderFlow() {
