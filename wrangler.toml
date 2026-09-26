@@ -1,0 +1,8 @@
+name = "gym-tracker"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gym-tracker"
+database_id = "1f58662c-18fc-458e-8bed-6c8ef7b45832"
