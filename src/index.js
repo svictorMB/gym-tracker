@@ -1,7 +1,7 @@
 // Gym Tracker — Cloudflare Worker + Supabase
 // Identity: Supabase Auth magic links (the browser talks to Supabase Auth directly with the anon key).
 // Data: Supabase Postgres via PostgREST, accessed only from this Worker with the service role key.
-// Config: SUPABASE_URL and SUPABASE_ANON_KEY as vars, SUPABASE_SERVICE_KEY as a secret.
+// Config: SUPABASE_URL as a var; SUPABASE_ANON_KEY, SUPABASE_SERVICE_KEY and LEGACY_USERS as secrets.
 
 const WORKOUTS = {
   A: ["Leg press", "Chest press machine", "Seated cable row", "Dumbbell Romanian deadlift", "Seated shoulder press machine", "Plank (seconds)"],
@@ -23,13 +23,12 @@ const CUES = {
   "Dead bug (reps per side)": "Lower back pressed into the floor. Extend the opposite arm and leg, exhale as you extend, alternate sides.",
 };
 
-// Logs saved before accounts existed are attached to whoever signs in with these emails,
-// and these three are made buddies with each other automatically.
-const LEGACY = {
-  "samueldavidson@gmail.com": "Sam",
-  "selvakumar.victor@gmail.com": "Selva",
-  "g.ebenezer.thomas@gmail.com": "Ebe",
-};
+// Logs saved before accounts existed are attached to whoever signs in with an email listed in
+// the LEGACY_USERS secret (JSON: {"email": "name in the old logs", ...}), and those people are
+// made buddies with each other automatically. Kept out of git so the emails stay private.
+function legacyUsers(env) {
+  try { return JSON.parse(env.LEGACY_USERS || "{}"); } catch { return {}; }
+}
 
 const PALETTE = ["#1F4FD8", "#D9772B", "#1E8E55", "#8E44AD", "#C2185B", "#00838F", "#6D4C41", "#455A64"];
 
@@ -38,7 +37,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) {
       try { return await api(request, env, url); }
-      catch (e) { return json({ error: "Server error: " + (e && e.message ? e.message : e) }, 500); }
+      catch (e) { console.error(e); return json({ error: "Something went wrong on the server. Try again." }, 500); }
     }
     const cfg = JSON.stringify({ url: env.SUPABASE_URL || "", anonKey: env.SUPABASE_ANON_KEY || "" }).replace(/</g, "\\u003c");
     return new Response(HTML.replace("__SB_CONFIG__", cfg), { headers: { "content-type": "text/html; charset=utf-8" } });
@@ -53,28 +52,90 @@ function json(data, status = 200) {
 
 const pub = p => ({ id: p.id, username: p.username, name: p.name, color: PALETTE[Number(p.seq || 0) % PALETTE.length] });
 const q = encodeURIComponent;
+const isDate = s => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(s))) return false;
+  const t = Date.parse(s + "T00:00:00Z");
+  return !isNaN(t) && new Date(t).toISOString().slice(0, 10) === s;
+};
+const rowId = v => { const n = Number(v); return Number.isInteger(n) && n > 0 ? n : null; };
 
-// PostgREST call with the service role key.
+// PostgREST call with the service role key. Errors carry the HTTP status and Postgres code.
 async function sb(env, path, opts = {}) {
   const method = opts.method || "GET";
   const headers = { apikey: env.SUPABASE_SERVICE_KEY, authorization: "Bearer " + env.SUPABASE_SERVICE_KEY, "content-type": "application/json" };
   if (opts.prefer) headers.prefer = opts.prefer; else if (method !== "GET") headers.prefer = "return=representation";
   const r = await fetch(env.SUPABASE_URL + "/rest/v1/" + path, { method, headers, body: opts.body === undefined ? undefined : JSON.stringify(opts.body) });
   const text = await r.text();
-  if (!r.ok) throw new Error("Supabase " + r.status + ": " + text.slice(0, 300));
+  if (!r.ok) {
+    let info = {}; try { info = JSON.parse(text); } catch {}
+    throw Object.assign(new Error("Supabase " + r.status + ": " + text.slice(0, 300)), { status: r.status, code: info.code, hint: info.hint });
+  }
   return text ? JSON.parse(text) : null;
 }
 
-// Validates the browser's Supabase access token and loads the profile.
+// Reads every matching row. PostgREST caps each response (1000 rows by default), so page through.
+async function sbAll(env, path) {
+  const PAGE = 1000, out = [];
+  for (let offset = 0; ; offset += PAGE) {
+    const rows = await sb(env, path + "&limit=" + PAGE + "&offset=" + offset);
+    out.push(...rows);
+    if (rows.length < PAGE) return out;
+  }
+}
+
+// ---------- auth ----------
+
+const b64url = s => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(s.length / 4) * 4, "=")), c => c.charCodeAt(0));
+let jwks = { keys: {}, at: 0 };
+
+async function signingKey(env, kid) {
+  const age = Date.now() - jwks.at;
+  if (age > 600000 || (!jwks.keys[kid] && age > 60000)) {
+    const r = await fetch(env.SUPABASE_URL + "/auth/v1/.well-known/jwks.json");
+    if (r.ok) {
+      const keys = {};
+      for (const k of (await r.json()).keys || []) {
+        if (k.kty === "EC" && k.crv === "P-256" && k.kid) {
+          keys[k.kid] = await crypto.subtle.importKey("jwk", { kty: k.kty, crv: k.crv, x: k.x, y: k.y }, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+        }
+      }
+      jwks = { keys, at: Date.now() };
+    }
+  }
+  return jwks.keys[kid] || null;
+}
+
+// Checks a Supabase access token against the project's published signing keys, without a
+// round trip to Supabase Auth. Returns the claims, null for a bad token, or undefined when the
+// token isn't one we can check locally (then the caller asks Supabase Auth instead).
+async function verifyJwt(env, token) {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  let header, claims, sig;
+  try {
+    header = JSON.parse(new TextDecoder().decode(b64url(parts[0])));
+    claims = JSON.parse(new TextDecoder().decode(b64url(parts[1])));
+    sig = b64url(parts[2]);
+  } catch { return null; }
+  if (header.alg !== "ES256") return undefined;
+  const key = await signingKey(env, header.kid);
+  if (!key) return undefined;
+  const ok = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, key, sig, new TextEncoder().encode(parts[0] + "." + parts[1]));
+  if (!ok || !(claims.exp > Date.now() / 1000) || claims.aud !== "authenticated" || claims.iss !== env.SUPABASE_URL + "/auth/v1" || !claims.sub) return null;
+  return claims;
+}
+
+// Identifies the signed-in user from the browser's Supabase access token.
 async function currentUser(request, env) {
   const auth = request.headers.get("authorization") || "";
   if (!/^Bearer \S+$/.test(auth)) return null;
+  const claims = await verifyJwt(env, auth.slice(7));
+  if (claims) return { id: claims.sub, email: String(claims.email || "").toLowerCase() };
+  if (claims === null) return null;
   const r = await fetch(env.SUPABASE_URL + "/auth/v1/user", { headers: { apikey: env.SUPABASE_ANON_KEY, authorization: auth } });
   if (!r.ok) return null;
   const u = await r.json();
-  if (!u || !u.id) return null;
-  const rows = await sb(env, "profiles?id=eq." + u.id + "&select=id,seq,email,username,name");
-  return { id: u.id, email: String(u.email || "").toLowerCase(), profile: rows[0] || null };
+  return u && u.id ? { id: u.id, email: String(u.email || "").toLowerCase() } : null;
 }
 
 async function friendsOf(env, uid) {
@@ -103,8 +164,14 @@ async function api(request, env, url) {
   const body = async () => { try { return await request.json(); } catch { return {}; } };
 
   const me = await currentUser(request, env);
-  if (method === "GET" && path === "me") return json({ user: me ? { id: me.id, email: me.email } : null, profile: me && me.profile ? pub(me.profile) : null });
-  if (!me) return json({ error: "Please sign in" }, 401);
+  if (!me) return method === "GET" && path === "me" ? json({ user: null, profile: null }) : json({ error: "Please sign in" }, 401);
+  const needsCircle = path !== "me" && path !== "profile";
+  const [profRows, friends] = await Promise.all([
+    sb(env, "profiles?id=eq." + me.id + "&select=id,seq,email,username,name"),
+    needsCircle ? friendsOf(env, me.id) : null,
+  ]);
+  me.profile = profRows[0] || null;
+  if (method === "GET" && path === "me") return json({ user: { id: me.id, email: me.email }, profile: me.profile ? pub(me.profile) : null });
 
   // --- first-time profile ---
   if (method === "POST" && path === "profile") {
@@ -116,13 +183,19 @@ async function api(request, env, url) {
     if (!name || name.length > 30) return json({ error: "Enter a display name (up to 30 characters)" }, 400);
     const taken = await sb(env, "profiles?username=eq." + q(username) + "&select=id");
     if (taken.length) return json({ error: "That username is taken" }, 409);
-    const [prof] = await sb(env, "profiles", { method: "POST", body: { id: me.id, email: me.email, username, name } });
-    const legacyName = LEGACY[me.email];
+    let prof;
+    try { [prof] = await sb(env, "profiles", { method: "POST", body: { id: me.id, email: me.email, username, name } }); }
+    catch (e) {
+      // Unique violation: someone took the username a moment ago, or this profile was just created.
+      if (e.code === "23505") return json({ error: /username/.test(e.message) ? "That username is taken" : "Profile already set up" }, 409);
+      throw e;
+    }
+    const legacy = legacyUsers(env), legacyName = legacy[me.email];
     if (legacyName) {
       await sb(env, "lifts?user_id=is.null&person=eq." + q(legacyName), { method: "PATCH", body: { user_id: me.id }, prefer: "return=minimal" });
       await sb(env, "weights?user_id=is.null&person=eq." + q(legacyName), { method: "PATCH", body: { user_id: me.id }, prefer: "return=minimal" });
-      const crew = Object.keys(LEGACY).filter(e => e !== me.email);
-      const others = await sb(env, "profiles?email=in." + q("(" + crew.map(e => '"' + e + '"').join(",") + ")") + "&select=id");
+      const crew = Object.keys(legacy).filter(e => e !== me.email);
+      const others = crew.length ? await sb(env, "profiles?email=in." + q("(" + crew.map(e => '"' + e + '"').join(",") + ")") + "&select=id") : [];
       if (others.length) {
         await sb(env, "friendships?on_conflict=requester_id,addressee_id", {
           method: "POST", prefer: "return=minimal,resolution=ignore-duplicates",
@@ -134,7 +207,6 @@ async function api(request, env, url) {
   }
   if (!me.profile) return json({ error: "Finish setting up your profile first" }, 403);
 
-  const friends = await friendsOf(env, me.id);
   const circle = [pub(me.profile), ...friends.accepted.map(({ fid, ...u }) => u)];
   const ids = circle.map(u => u.id);
   const inIds = "in.(" + ids.join(",") + ")";
@@ -143,8 +215,8 @@ async function api(request, env, url) {
   // --- data ---
   if (method === "GET" && path === "data") {
     const [weights, lifts] = await Promise.all([
-      sb(env, "weights?user_id=" + inIds + "&select=id,user_id,date,lbs&order=date.asc,id.asc"),
-      sb(env, "lifts?user_id=" + inIds + "&select=id,user_id,date,workout,exercise,weight,reps&order=date.desc,id.desc"),
+      sbAll(env, "weights?user_id=" + inIds + "&select=id,user_id,logged_by,date,lbs&order=date.asc,id.asc"),
+      sbAll(env, "lifts?user_id=" + inIds + "&select=id,user_id,logged_by,date,workout,exercise,weight,reps&order=date.desc,id.desc"),
     ]);
     return json({ user: pub(me.profile), people: circle, friends, workouts: WORKOUTS, cues: CUES, weights, lifts });
   }
@@ -153,8 +225,9 @@ async function api(request, env, url) {
     const b = await body();
     const uid = String(b.for || me.id);
     if (!ids.includes(uid)) return json({ error: "You can only log for yourself or a buddy" }, 403);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(b.date || "")) || !(b.lbs > 0)) return json({ error: "Need a date and a weight" }, 400);
-    await sb(env, "weights", { method: "POST", body: { user_id: uid, person: nameOf(uid), date: b.date, lbs: Number(b.lbs) }, prefer: "return=minimal" });
+    const lbs = Number(b.lbs);
+    if (!isDate(b.date) || !(lbs > 0 && lbs < 1500)) return json({ error: "Need a date and a weight" }, 400);
+    await sb(env, "weights", { method: "POST", body: { user_id: uid, logged_by: me.id, person: nameOf(uid), date: b.date, lbs }, prefer: "return=minimal" });
     return json({ ok: true });
   }
 
@@ -165,21 +238,27 @@ async function api(request, env, url) {
     const raw = Array.isArray(b.sets) ? b.sets : [];
     const sets = raw.filter(x => x && (String(x.weight ?? "").trim() !== "" || String(x.reps ?? "").trim() !== ""))
                     .map(x => ({ weight: Number(x.weight), reps: Number(x.reps) }));
-    const valid = /^\d{4}-\d{2}-\d{2}$/.test(String(b.date || "")) && WORKOUTS[b.workout]?.includes(b.exercise)
-      && sets.length > 0 && sets.every(x => x.weight >= 0 && Number.isInteger(x.reps) && x.reps > 0);
+    const valid = isDate(b.date) && WORKOUTS[b.workout]?.includes(b.exercise) && sets.length > 0 && sets.length <= 20
+      && sets.every(x => x.weight >= 0 && x.weight < 2000 && Number.isInteger(x.reps) && x.reps > 0 && x.reps < 10000);
     if (!valid) return json({ error: "Need a date, exercise and at least one set with weight and reps" }, 400);
-    await sb(env, "lifts?user_id=eq." + uid + "&date=eq." + b.date + "&exercise=eq." + q(b.exercise), { method: "DELETE", prefer: "return=minimal" });
-    await sb(env, "lifts", { method: "POST", prefer: "return=minimal",
-      body: sets.map(x => ({ user_id: uid, person: nameOf(uid), date: b.date, workout: b.workout, exercise: b.exercise, weight: x.weight, reps: x.reps })) });
-    return json({ ok: true, saved: sets.length });
+    try {
+      const saved = await sb(env, "rpc/replace_lifts", { method: "POST", body: {
+        p_actor: me.id, p_user: uid, p_person: nameOf(uid), p_date: b.date, p_workout: b.workout, p_exercise: b.exercise, p_sets: sets } });
+      return json({ ok: true, saved });
+    } catch (e) {
+      if (e.hint === "locked") return json({ error: nameOf(uid) + " already logged this exercise today, so only they can change it." }, 403);
+      throw e;
+    }
   }
 
   if (method === "DELETE" && (path === "weight" || path === "lift")) {
-    const rowIds = (url.searchParams.get("ids") || url.searchParams.get("id") || "").split(",").map(Number).filter(n => Number.isInteger(n) && n > 0);
+    const rowIds = (url.searchParams.get("ids") || url.searchParams.get("id") || "").split(",").map(rowId).filter(Boolean);
     if (!rowIds.length) return json({ error: "Missing id" }, 400);
     const table = path === "weight" ? "weights" : "lifts";
-    await sb(env, table + "?id=in.(" + rowIds.join(",") + ")&user_id=" + inIds, { method: "DELETE", prefer: "return=minimal" });
-    return json({ ok: true });
+    // Your own rows, or rows you entered for a buddy.
+    const gone = await sb(env, table + "?id=in.(" + rowIds.join(",") + ")&user_id=" + inIds + "&or=(user_id.eq." + me.id + ",logged_by.eq." + me.id + ")&select=id", { method: "DELETE" });
+    if (!gone.length) return json({ error: "You can only delete your own entries or ones you logged for a buddy" }, 403);
+    return json({ ok: true, deleted: gone.length });
   }
 
   // --- buddies ---
@@ -202,15 +281,17 @@ async function api(request, env, url) {
   }
 
   if (method === "POST" && path === "friends/accept") {
-    const b = await body();
-    const rows = await sb(env, "friendships?id=eq." + Number(b.id) + "&addressee_id=eq." + me.id + "&status=eq.pending", { method: "PATCH", body: { status: "accepted" } });
+    const id = rowId((await body()).id);
+    if (!id) return json({ error: "Missing id" }, 400);
+    const rows = await sb(env, "friendships?id=eq." + id + "&addressee_id=eq." + me.id + "&status=eq.pending", { method: "PATCH", body: { status: "accepted" } });
     if (!rows.length) return json({ error: "Request not found" }, 404);
     return json({ ok: true });
   }
 
   if (method === "POST" && path === "friends/remove") {
-    const b = await body();
-    await sb(env, "friendships?id=eq." + Number(b.id) + "&or=(requester_id.eq." + me.id + ",addressee_id.eq." + me.id + ")", { method: "DELETE", prefer: "return=minimal" });
+    const id = rowId((await body()).id);
+    if (!id) return json({ error: "Missing id" }, 400);
+    await sb(env, "friendships?id=eq." + id + "&or=(requester_id.eq." + me.id + ",addressee_id.eq." + me.id + ")", { method: "DELETE", prefer: "return=minimal" });
     return json({ ok: true });
   }
 
@@ -353,14 +434,14 @@ const HTML = `<!doctype html>
       </div>
     </details>
 
-    <nav class="tabbar" id="tabbar" aria-label="Sections">
-      <button type="button" data-tab="workout" role="tab">Workout</button>
-      <button type="button" data-tab="weigh" role="tab">Weigh in</button>
-      <button type="button" data-tab="bests" role="tab">Bests</button>
-      <button type="button" data-tab="recent" role="tab">Recent</button>
+    <nav class="tabbar" id="tabbar" role="tablist" aria-label="Sections">
+      <button type="button" data-tab="workout" role="tab" id="tab-workout" aria-controls="panel-workout">Workout</button>
+      <button type="button" data-tab="weigh" role="tab" id="tab-weigh" aria-controls="panel-weigh">Weigh in</button>
+      <button type="button" data-tab="bests" role="tab" id="tab-bests" aria-controls="panel-bests">Bests</button>
+      <button type="button" data-tab="recent" role="tab" id="tab-recent" aria-controls="panel-recent">Recent</button>
     </nav>
 
-    <section class="tab" data-tab="workout">
+    <section class="tab" data-tab="workout" role="tabpanel" id="panel-workout" aria-labelledby="tab-workout">
     <h2>Today's workout</h2>
     <div class="panel">
       <div class="row" style="margin-top:0">
@@ -388,7 +469,7 @@ const HTML = `<!doctype html>
     </div>
     </section>
 
-    <section class="tab" data-tab="weigh" hidden>
+    <section class="tab" data-tab="weigh" role="tabpanel" id="panel-weigh" aria-labelledby="tab-weigh" hidden>
     <h2>Weigh in</h2>
     <div class="panel">
       <div class="row" style="margin-top:0">
@@ -403,19 +484,19 @@ const HTML = `<!doctype html>
     <div class="panel" id="chart"><p class="empty">No weigh-ins yet. The chart appears after the first one.</p></div>
     </section>
 
-    <section class="tab" data-tab="bests" hidden>
+    <section class="tab" data-tab="bests" role="tabpanel" id="panel-bests" aria-labelledby="tab-bests" hidden>
     <h2>Personal bests</h2>
     <div class="panel wrap" id="pbs"></div>
     </section>
 
-    <section class="tab" data-tab="recent" hidden>
+    <section class="tab" data-tab="recent" role="tabpanel" id="panel-recent" aria-labelledby="tab-recent" hidden>
     <h2>Recent sets</h2>
     <div class="panel wrap" id="recent"></div>
     </section>
   </div>
 </main>
 
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/dist/umd/supabase.min.js" integrity="sha384-dl/4LkSyQ4uEucc48NM6VDZLAjLLq9yMzZ5JLXumBq7Ld33XBof73hseOqPhO89+" crossorigin="anonymous"></script>
 <script>
 (() => {
   const SB = __SB_CONFIG__;
@@ -424,7 +505,9 @@ const HTML = `<!doctype html>
   let data = null, me = null, person = null, savedPersonId = null;
   let workout = "A", step = 0, firstLoad = true;
 
-  const today = new Date().toISOString().slice(0, 10);
+  // The phone's local calendar date (toISOString would give the UTC date).
+  const localDate = (d = new Date()) => d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+  const today = localDate();
   $("ldate").value = today; $("wdate").value = today;
   try {
     savedPersonId = localStorage.getItem("gt_person") || null;
@@ -446,10 +529,16 @@ const HTML = `<!doctype html>
   function showTab(t) {
     tab = t;
     [...document.querySelectorAll("section.tab")].forEach(sec => sec.hidden = sec.dataset.tab !== t);
-    [...$("tabbar").children].forEach(b => b.setAttribute("aria-selected", b.dataset.tab === t));
+    [...$("tabbar").children].forEach(b => { b.setAttribute("aria-selected", b.dataset.tab === t); b.tabIndex = b.dataset.tab === t ? 0 : -1; });
     try { localStorage.setItem("gt_tab", t); } catch {}
   }
   [...$("tabbar").children].forEach(b => b.onclick = () => showTab(b.dataset.tab));
+  $("tabbar").onkeydown = e => {
+    const bs = [...$("tabbar").children], i = bs.findIndex(b => b.dataset.tab === tab);
+    const j = e.key === "ArrowRight" ? (i + 1) % bs.length : e.key === "ArrowLeft" ? (i + bs.length - 1) % bs.length : e.key === "Home" ? 0 : e.key === "End" ? bs.length - 1 : -1;
+    if (j < 0) return;
+    e.preventDefault(); showTab(bs[j].dataset.tab); bs[j].focus();
+  };
   showTab(tab);
 
   // ----- screens -----
@@ -488,7 +577,10 @@ const HTML = `<!doctype html>
 
   $("logout").onclick = async () => { try { await supa.auth.signOut(); } catch {} show("auth"); };
 
-  async function boot() {
+  // Startup and the INITIAL_SESSION auth event both ask to boot; share one run between them.
+  let booting = null;
+  function boot() { return booting || (booting = doBoot().finally(() => { booting = null; })); }
+  async function doBoot() {
     const t = await token();
     if (!t) { show("auth"); return; }
     let who;
@@ -611,8 +703,8 @@ const HTML = `<!doctype html>
   $("prev").onclick = () => go(step - 1);
   $("ldate").onchange = () => go(step);
 
-  function bestFor(p, ex) {
-    return data.lifts.filter(l => l.user_id === p.id && l.exercise === ex).sort((a, b) => b.weight - a.weight || b.reps - a.reps)[0];
+  function bestFor(p, ex, skipDate) {
+    return data.lifts.filter(l => l.user_id === p.id && l.exercise === ex && l.date !== skipDate).sort((a, b) => b.weight - a.weight || b.reps - a.reps)[0];
   }
 
   $("liftsave").onclick = async () => {
@@ -621,7 +713,7 @@ const HTML = `<!doctype html>
       .filter(x => x.weight !== "" || x.reps !== "");
     const body = { for: person.id, date: $("ldate").value, workout, exercise: EX()[step], sets };
     if (!body.exercise) return;
-    const prev = bestFor(person, body.exercise);
+    const prev = bestFor(person, body.exercise, body.date); // today's sets for it are about to be replaced
     const m = $("liftmsg"); m.className = "msg"; m.textContent = "Saving…"; $("liftsave").disabled = true;
     try {
       const r = await post("lifts", body); await load();
@@ -650,7 +742,8 @@ const HTML = `<!doctype html>
     const W = data.weights;
     if (!W.length) { $("chart").innerHTML = '<p class="empty">No weigh-ins yet. The chart appears after the first one.</p>'; return; }
     const dates = [...new Set(W.map(w => w.date))].sort();
-    const xs = d => 40 + (dates.length === 1 ? 260 : (dates.indexOf(d) / (dates.length - 1)) * 520);
+    const t0 = Date.parse(dates[0]), span = Date.parse(dates[dates.length - 1]) - t0;
+    const xs = d => 40 + (span ? (Date.parse(d) - t0) / span * 540 : 270);
     const lo = Math.min(...W.map(w => w.lbs)) - 3, hi = Math.max(...W.map(w => w.lbs)) + 3;
     const ys = v => 20 + (1 - (v - lo) / (hi - lo)) * 180;
     let svg = '<svg viewBox="0 0 600 240" role="img" aria-label="Body weight over time">';
@@ -675,6 +768,8 @@ const HTML = `<!doctype html>
     $("pbs").innerHTML = h + "</table>";
   }
 
+  // Matches the server rule: your own entries, or ones you logged for a buddy.
+  const canDelete = row => row.user_id === me.id || row.logged_by === me.id;
   function renderRecent() {
     const groups = [];
     for (const l of data.lifts) {
@@ -684,9 +779,9 @@ const HTML = `<!doctype html>
     const L = groups.slice(0, 25), W = data.weights.slice(-10).reverse();
     if (!L.length && !W.length) { $("recent").innerHTML = '<p class="empty">Nothing logged yet.</p>'; return; }
     let h = "<table><tr><th>Date</th><th>Who</th><th>What</th><th></th></tr>";
-    const rows = [...L.map(g => { const ss = g.sets.slice().sort((a, b) => a.id - b.id); return { d: g.d, uid: g.uid, t: g.ex + " " + fmt(ss), k: "lift", id: ss[ss.length - 1].id, ids: ss.map(x => x.id).join(","), n: ss.length }; }),
-                  ...W.map(w => ({ d: w.date, uid: w.user_id, t: "Weigh-in " + w.lbs + " lb", k: "weight", id: w.id, ids: String(w.id), n: 1 }))].sort((a, b) => b.d.localeCompare(a.d) || b.id - a.id).slice(0, 30);
-    rows.forEach(r => { const u = byId(r.uid) || { name: "?", color: "var(--muted)" }; h += '<tr><td class="n">' + r.d + '</td><td class="n"><i class="chip" style="background:' + u.color + '"></i>' + esc(u.name) + "</td><td>" + r.t + '</td><td><button class="del" type="button" data-k="' + r.k + '" data-ids="' + r.ids + '" data-n="' + r.n + '">Delete</button></td></tr>'; });
+    const rows = [...L.map(g => { const ss = g.sets.slice().sort((a, b) => a.id - b.id); return { d: g.d, uid: g.uid, t: g.ex + " " + fmt(ss), k: "lift", id: ss[ss.length - 1].id, ids: ss.filter(canDelete).map(x => x.id).join(","), n: ss.filter(canDelete).length }; }),
+                  ...W.map(w => ({ d: w.date, uid: w.user_id, t: "Weigh-in " + w.lbs + " lb", k: "weight", id: w.id, ids: canDelete(w) ? String(w.id) : "", n: canDelete(w) ? 1 : 0 }))].sort((a, b) => b.d.localeCompare(a.d) || b.id - a.id).slice(0, 30);
+    rows.forEach(r => { const u = byId(r.uid) || { name: "?", color: "var(--muted)" }; h += '<tr><td class="n">' + r.d + '</td><td class="n"><i class="chip" style="background:' + u.color + '"></i>' + esc(u.name) + "</td><td>" + esc(r.t) + "</td><td>" + (r.n ? '<button class="del" type="button" data-k="' + r.k + '" data-ids="' + r.ids + '" data-n="' + r.n + '">Delete</button>' : "") + "</td></tr>"; });
     $("recent").innerHTML = h + "</table>";
   }
 
