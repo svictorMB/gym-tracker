@@ -7,7 +7,7 @@ Weigh-in and workout tracker with a buddy system. Cloudflare Worker + Supabase (
 - Enter your email and open the login link it sends. First time in, pick a name and username.
 - Open **Buddies**, enter a buddy's username and send a request. They accept from their Buddies panel.
 - You and your accepted buddies see each other's weigh-ins, sets and personal bests, and can log sets for each other when sharing a phone at the gym. A buddy can only change or delete entries they logged themselves.
-- **Today's workout** walks through the day's exercises one at a time, prefilling last time's sets. Two programs: **Full body** (3 days a week, alternate A and B) and **Muscle split** (4–5 days a week: Push, Pull, Legs, Upper, then Lower as a fifth day). The app tells each person which day they did last and which comes next.
+- **Today's workout** walks through the day's exercises one at a time, prefilling last time's sets. Each exercise shows its recommended sets × reps (the set rows match), a one-line form cue, and a **Watch how to do it** link that opens a YouTube search for that exercise. Two programs: **Full body** (3 days a week, alternate A and B) and **Muscle split** (4–5 days a week: Push, Pull, Legs, Upper, then Lower as a fifth day). The app tells each person which day they did last and which comes next.
 - **Progress** shows each person's body weight from their first weigh-in to the latest, with the change, plus how many sessions they trained in the last four weeks and their last workout day.
 - **Trainers** (emails listed in the `TRAINERS` secret as a JSON array) see and can log for everyone with a profile, not just their buddies.
 

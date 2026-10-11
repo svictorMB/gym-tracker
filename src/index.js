@@ -64,6 +64,24 @@ function legacyUsers(env) {
   try { return JSON.parse(env.LEGACY_USERS || "{}"); } catch { return {}; }
 }
 
+// Recommended sets × reps. "target" is the rep count prefilled when someone has no history yet.
+const RX = {
+  "Plank (seconds)": { sets: 3, reps: "30–60 s", target: 30 },
+  "Dead bug (reps per side)": { sets: 3, reps: "10 per side", target: 10 },
+  "Walking lunges (reps per side)": { sets: 3, reps: "10 per leg", target: 10 },
+  "Single-arm dumbbell row": { sets: 3, reps: "10–12 per arm", target: 10 },
+  "Seated leg curl": { sets: 3, reps: "12–15", target: 12 },
+  "Leg extension": { sets: 3, reps: "12–15", target: 12 },
+  "Cable face pull": { sets: 3, reps: "15", target: 15 },
+  "Cable chest fly": { sets: 3, reps: "12–15", target: 12 },
+  "Dumbbell lateral raise": { sets: 3, reps: "12–15", target: 12 },
+  "Triceps pushdown": { sets: 3, reps: "12–15", target: 12 },
+  "Cable hammer curl": { sets: 3, reps: "12", target: 12 },
+  "Standing calf raise": { sets: 4, reps: "15", target: 15 },
+  "Hip thrust machine": { sets: 4, reps: "10–12", target: 10 },
+};
+const RX_DEFAULT = { sets: 3, reps: "10–12", target: 10 };
+
 const PALETTE = ["#1F4FD8", "#D9772B", "#1E8E55", "#8E44AD", "#C2185B", "#00838F", "#6D4C41", "#455A64"];
 
 export default {
@@ -254,7 +272,7 @@ async function api(request, env, url) {
       sbAll(env, "weights?user_id=" + inIds + "&select=id,user_id,logged_by,date,lbs&order=date.asc,id.asc"),
       sbAll(env, "lifts?user_id=" + inIds + "&select=id,user_id,logged_by,date,workout,exercise,weight,reps&order=date.desc,id.desc"),
     ]);
-    return json({ user: pub(me.profile), trainer: isTrainer, people: circle, friends, workouts: WORKOUTS, programs: PROGRAMS, cues: CUES, weights, lifts });
+    return json({ user: pub(me.profile), trainer: isTrainer, people: circle, friends, workouts: WORKOUTS, programs: PROGRAMS, cues: CUES, rx: RX, rxDefault: RX_DEFAULT, weights, lifts });
   }
 
   if (method === "POST" && path === "weight") {
@@ -425,6 +443,9 @@ const HTML = `<!doctype html>
   .stepn{font-size:13px;color:var(--muted)}
   .exname{font-size:20px;font-weight:700;margin:2px 0 4px}
   .cue{font-size:14px;color:var(--muted);margin:0 0 6px}
+  .rxrow{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:0 0 8px;font-size:14px}
+  .rxrow b{font-weight:600}
+  .howto{flex:none;color:var(--accent);text-decoration:none;font-weight:600;font-size:13px;border:1px solid var(--accent);border-radius:8px;padding:5px 10px;white-space:nowrap}
   .last{font-size:14px;margin:0}
   .nav{display:flex;gap:8px;margin-top:10px}
   .nav button{flex:1;padding:11px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);font-size:15px;cursor:pointer}
@@ -506,14 +527,10 @@ const HTML = `<!doctype html>
         <div class="stepn" id="stepn"></div>
         <div class="exname" id="exname"></div>
         <p class="cue" id="cue"></p>
+        <div class="rxrow"><span id="rx"></span><a class="howto" id="howto" href="#" target="_blank" rel="noopener">▶ Watch how to do it</a></div>
         <p class="last" id="last"></p>
-        <div class="sets" id="sets">
-          <div class="set"><span></span><label>Weight (lbs)</label><label>Reps or seconds</label></div>
-          <div class="set"><span class="setn">Set 1</span><input class="sw" type="number" inputmode="decimal" min="0" step="2.5" aria-label="Set 1 weight"><input class="sr" type="number" inputmode="numeric" min="1" aria-label="Set 1 reps"></div>
-          <div class="set"><span class="setn">Set 2</span><input class="sw" type="number" inputmode="decimal" min="0" step="2.5" aria-label="Set 2 weight"><input class="sr" type="number" inputmode="numeric" min="1" aria-label="Set 2 reps"></div>
-          <div class="set"><span class="setn">Set 3</span><input class="sw" type="number" inputmode="decimal" min="0" step="2.5" aria-label="Set 3 weight"><input class="sr" type="number" inputmode="numeric" min="1" aria-label="Set 3 reps"></div>
-        </div>
-        <p class="hint">Use 0 lbs for bodyweight. Leave a set blank to skip it. Rows prefill from last time. After saving, tap the next person: their own last numbers load if they have any, otherwise yours carry over. Saving again replaces that person's sets for this exercise today.</p>
+        <div class="sets" id="sets"></div>
+        <p class="hint">Use 0 lbs for bodyweight. Leave a set blank to skip it. Rows match the recommended sets and prefill from last time. After saving, tap the next person: their own last numbers load if they have any, otherwise yours carry over. Saving again replaces that person's sets for this exercise today.</p>
         <button class="save" id="liftsave" type="button">Save sets</button>
         <div class="msg" id="liftmsg"></div>
         <div class="nav"><button type="button" id="prev">← Back</button><button type="button" id="next">Next exercise →</button></div>
@@ -723,11 +740,18 @@ const HTML = `<!doctype html>
   function remember() { try { localStorage.setItem("gt_program", program); localStorage.setItem("gt_workout", workout); localStorage.setItem("gt_step", today + ":" + step); } catch {} }
   const setRows = () => [...document.querySelectorAll("#sets .set")].filter(r => r.querySelector(".sw"));
 
+  const rxFor = ex => (data.rx || {})[ex] || data.rxDefault || { sets: 3, reps: "10–12", target: 10 };
+  function buildSetRows(n) {
+    let h = '<div class="set"><span></span><label>Weight (lbs)</label><label>Reps or seconds</label></div>';
+    for (let i = 1; i <= n; i++) h += '<div class="set"><span class="setn">Set ' + i + '</span><input class="sw" type="number" inputmode="decimal" min="0" step="2.5" aria-label="Set ' + i + ' weight"><input class="sr" type="number" inputmode="numeric" min="1" aria-label="Set ' + i + ' reps"></div>';
+    $("sets").innerHTML = h;
+  }
   function fillFromHistory() {
     const ex = EX()[step]; if (!ex) return;
-    const mine = setsToday(person, ex), lt = lastTime(person, ex);
+    const mine = setsToday(person, ex), lt = lastTime(person, ex), rx = rxFor(ex);
     const src = mine.length ? mine : (lt ? lt.sets : []);
-    setRows().forEach((r, i) => { r.querySelector(".sw").value = src[i] ? src[i].weight : ""; r.querySelector(".sr").value = src[i] ? src[i].reps : ""; });
+    buildSetRows(Math.max(rx.sets, src.length));
+    setRows().forEach((r, i) => { r.querySelector(".sw").value = src[i] ? src[i].weight : ""; r.querySelector(".sr").value = src[i] ? src[i].reps : (src.length ? "" : rx.target); });
   }
 
   function go(i) {
@@ -767,6 +791,9 @@ const HTML = `<!doctype html>
       $("stepn").textContent = "Exercise " + (step + 1) + " of " + n;
       $("exname").textContent = ex[step];
       $("cue").textContent = (data.cues || {})[ex[step]] || "";
+      const rx = rxFor(ex[step]);
+      $("rx").innerHTML = "Recommended: <b>" + rx.sets + " sets × " + esc(rx.reps) + "</b>";
+      $("howto").href = "https://www.youtube.com/results?search_query=" + encodeURIComponent("how to do " + ex[step].split(" (")[0] + " proper form");
       const lt = lastTime(person, ex[step]), mine = setsToday(person, ex[step]);
       $("last").textContent = mine.length ? person.name + " today: " + fmt(mine) : lt ? person.name + " last time (" + lt.date + "): " + fmt(lt.sets) : "First time logging this one for " + person.name + ".";
       $("next").textContent = step === n - 1 ? "Finish workout ✓" : "Next exercise →";
