@@ -3,6 +3,7 @@
 // Rows are inserted with user_id NULL and attach to accounts when people set up their profile.
 // Usage: node scripts/migrate-from-d1.mjs [--dry-run]
 import { join } from "node:path";
+import { homedir } from "node:os";
 import { readFileSync, existsSync } from "node:fs";
 
 const dry = process.argv.includes("--dry-run");
@@ -18,8 +19,16 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) { console.error("Need SUPABASE_URL a
 const D1_ACCOUNT = "8e2129b11a7145938453143ccd3f1ec8", D1_ID = "1f58662c-18fc-458e-8bed-6c8ef7b45832";
 function cfToken() {
   if (process.env.CLOUDFLARE_API_TOKEN) return process.env.CLOUDFLARE_API_TOKEN;
-  const cfg = join(process.env.APPDATA || "", "xdg.config", ".wrangler", "config", "default.toml");
-  const m = existsSync(cfg) && readFileSync(cfg, "utf8").match(/^oauth_token\s*=\s*"([^"]+)"/m);
+  // Where `wrangler login` keeps its token on Windows, macOS and Linux.
+  const home = homedir(), rel = [".wrangler", "config", "default.toml"];
+  const cfg = [
+    process.env.XDG_CONFIG_HOME && join(process.env.XDG_CONFIG_HOME, ...rel),
+    process.env.APPDATA && join(process.env.APPDATA, "xdg.config", ...rel),
+    join(home, "Library", "Preferences", ...rel),
+    join(home, ".config", ...rel),
+    join(home, ...rel),
+  ].find(f => f && existsSync(f));
+  const m = cfg && readFileSync(cfg, "utf8").match(/^oauth_token\s*=\s*"([^"]+)"/m);
   if (!m) throw new Error("Run npx wrangler login first (or set CLOUDFLARE_API_TOKEN)");
   return m[1];
 }
