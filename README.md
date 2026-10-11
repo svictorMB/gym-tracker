@@ -7,7 +7,7 @@ Weigh-in and workout tracker with a buddy system. Cloudflare Worker + Supabase (
 - Enter your email and open the login link it sends. First time in, pick a name and username.
 - Open **Buddies**, enter a buddy's username and send a request. They accept from their Buddies panel.
 - You and your accepted buddies see each other's weigh-ins, sets and personal bests, and can log sets for each other when sharing a phone at the gym.
-- **Today's workout** walks through workout A or B one exercise at a time, prefilling last time's sets.
+- **Today's workout** walks through the day's exercises one at a time, prefilling last time's sets. Two programs: **Full body** (3 days a week, alternate A and B) and **Muscle split** (4–5 days a week: Push, Pull, Legs, Upper, then Lower as a fifth day). The app tells each person which day they did last and which comes next.
 
 ## Setup
 1. In Supabase: run `supabase/schema.sql` in the SQL editor, and add `https://gym-tracker.ctcapps.workers.dev/**` under Authentication → URL Configuration → Redirect URLs.

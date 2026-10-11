@@ -3,10 +3,29 @@
 // Data: Supabase Postgres via PostgREST, accessed only from this Worker with the service role key.
 // Config: SUPABASE_URL and SUPABASE_ANON_KEY as vars, SUPABASE_SERVICE_KEY as a secret.
 
-const WORKOUTS = {
-  A: ["Leg press", "Chest press machine", "Seated cable row", "Dumbbell Romanian deadlift", "Seated shoulder press machine", "Plank (seconds)"],
-  B: ["Goblet squat", "Lat pulldown", "Incline dumbbell press", "Seated leg curl", "Cable face pull", "Dead bug (reps per side)"],
+const PROGRAMS = {
+  fullbody: {
+    name: "Full body",
+    blurb: "3 days a week. Alternate A and B with a rest day between. Good starting point.",
+    days: {
+      A: ["Leg press", "Chest press machine", "Seated cable row", "Dumbbell Romanian deadlift", "Seated shoulder press machine", "Plank (seconds)"],
+      B: ["Goblet squat", "Lat pulldown", "Incline dumbbell press", "Seated leg curl", "Cable face pull", "Dead bug (reps per side)"],
+    },
+  },
+  split: {
+    name: "Muscle split",
+    blurb: "4–5 days a week, each day on a muscle group. Do Push, Pull, Legs, Upper in order; add Lower as a fifth day when you can.",
+    days: {
+      Push: ["Chest press machine", "Incline dumbbell press", "Seated shoulder press machine", "Cable chest fly", "Dumbbell lateral raise", "Triceps pushdown"],
+      Pull: ["Lat pulldown", "Seated cable row", "Single-arm dumbbell row", "Cable face pull", "Dumbbell biceps curl", "Cable hammer curl"],
+      Legs: ["Leg press", "Dumbbell Romanian deadlift", "Seated leg curl", "Leg extension", "Walking lunges (reps per side)", "Standing calf raise"],
+      Upper: ["Chest press machine", "Lat pulldown", "Seated shoulder press machine", "Seated cable row", "Cable face pull", "Plank (seconds)"],
+      Lower: ["Goblet squat", "Seated leg curl", "Leg extension", "Hip thrust machine", "Standing calf raise", "Dead bug (reps per side)"],
+    },
+  },
 };
+// Every workout day across programs, keyed by day name (used for validation and the guided flow).
+const WORKOUTS = Object.fromEntries(Object.values(PROGRAMS).flatMap(p => Object.entries(p.days)));
 
 const CUES = {
   "Leg press": "Feet shoulder-width on the plate. Lower until the knees are near 90°, press back up without locking out.",
@@ -21,6 +40,16 @@ const CUES = {
   "Seated leg curl": "Pad just above the ankles. Curl all the way, then return slowly without letting the stack drop.",
   "Cable face pull": "Rope at face height. Pull toward the forehead with the elbows high, squeeze the rear shoulders.",
   "Dead bug (reps per side)": "Lower back pressed into the floor. Extend the opposite arm and leg, exhale as you extend, alternate sides.",
+  "Cable chest fly": "Handles at chest height, slight bend in the elbows. Bring the hands together in front of the chest and open slowly.",
+  "Dumbbell lateral raise": "Raise to shoulder height with a slight elbow bend, lead with the elbows, lower under control. Keep it light.",
+  "Triceps pushdown": "Elbows pinned to the sides. Push the bar or rope down until the arms are straight, then let it rise slowly.",
+  "Single-arm dumbbell row": "One hand on the bench, flat back. Pull the dumbbell to the hip, squeeze, lower slowly. Log reps per arm.",
+  "Dumbbell biceps curl": "Elbows still at the sides. Curl up without swinging, lower slowly to a full stretch.",
+  "Cable hammer curl": "Rope with palms facing each other. Curl to the shoulders, elbows stay put, lower slowly.",
+  "Leg extension": "Pad on the shins, extend fully and pause for a second at the top, lower slowly.",
+  "Walking lunges (reps per side)": "Long step, back knee toward the floor, front shin vertical. Push through the front heel. Log steps per leg.",
+  "Standing calf raise": "Full stretch at the bottom, pause at the top. Slow and controlled, no bouncing.",
+  "Hip thrust machine": "Pad above the hips, chin tucked. Drive up until the hips are fully extended and squeeze the glutes at the top.",
 };
 
 // Logs saved before accounts existed are attached to whoever signs in with these emails,
@@ -146,7 +175,7 @@ async function api(request, env, url) {
       sb(env, "weights?user_id=" + inIds + "&select=id,user_id,date,lbs&order=date.asc,id.asc"),
       sb(env, "lifts?user_id=" + inIds + "&select=id,user_id,date,workout,exercise,weight,reps&order=date.desc,id.desc"),
     ]);
-    return json({ user: pub(me.profile), people: circle, friends, workouts: WORKOUTS, cues: CUES, weights, lifts });
+    return json({ user: pub(me.profile), people: circle, friends, workouts: WORKOUTS, programs: PROGRAMS, cues: CUES, weights, lifts });
   }
 
   if (method === "POST" && path === "weight") {
@@ -274,6 +303,10 @@ const HTML = `<!doctype html>
   .seg{display:flex;gap:6px}
   .seg button{flex:1;padding:10px 0;border:2px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);font-size:16px;font-weight:600;cursor:pointer}
   .seg button[aria-pressed=true]{border-color:var(--accent);color:var(--accent)}
+  .seg.days button{font-size:14px;padding:9px 0}
+  .pblurb{font-size:13px;color:var(--muted);margin:6px 0 0}
+  .nextup{font-size:13px;margin:8px 0 0}
+  .nextup b{color:var(--accent)}
   .inline{display:flex;gap:8px;margin:12px 0 0}
   .inline input{flex:1}
   .inline button,.mini{padding:0 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);cursor:pointer;font-size:14px}
@@ -365,8 +398,12 @@ const HTML = `<!doctype html>
     <div class="panel">
       <div class="row" style="margin-top:0">
         <div><label for="ldate">Date</label><input id="ldate" type="date"></div>
-        <div><label>Workout</label><div class="seg" id="wsel"><button type="button" data-w="A">A</button><button type="button" data-w="B">B</button></div></div>
+        <div><label>Program</label><div class="seg" id="psel"></div></div>
       </div>
+      <p class="pblurb" id="pblurb"></p>
+      <label class="mt">Today's day</label>
+      <div class="seg days" id="wsel"></div>
+      <p class="nextup" id="nextup"></p>
       <ol class="steps" id="steps" aria-label="Exercises in this workout"></ol>
       <div class="current" id="entry">
         <div class="stepn" id="stepn"></div>
@@ -422,13 +459,14 @@ const HTML = `<!doctype html>
   const $ = id => document.getElementById(id);
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   let data = null, me = null, person = null, savedPersonId = null;
-  let workout = "A", step = 0, firstLoad = true;
+  let program = "fullbody", workout = "A", step = 0, firstLoad = true;
 
   const today = new Date().toISOString().slice(0, 10);
   $("ldate").value = today; $("wdate").value = today;
   try {
     savedPersonId = localStorage.getItem("gt_person") || null;
-    if (["A", "B"].includes(localStorage.getItem("gt_workout"))) workout = localStorage.getItem("gt_workout");
+    const sp = localStorage.getItem("gt_program"); if (sp) program = sp;
+    const sw = localStorage.getItem("gt_workout"); if (sw) workout = sw;
     const s = localStorage.getItem("gt_step") || "";
     if (s.startsWith(today + ":")) step = Number(s.slice(today.length + 1)) || 0;
   } catch {}
@@ -553,7 +591,14 @@ const HTML = `<!doctype html>
   };
 
   // ----- guided workout -----
-  const EX = () => data.workouts[workout];
+  const PROG = () => data.programs[program] || (program = "fullbody", data.programs.fullbody);
+  const DAYS = () => Object.keys(PROG().days);
+  const EX = () => { if (!PROG().days[workout]) workout = DAYS()[0]; return PROG().days[workout]; };
+  function lastSession(p) {
+    const days = DAYS(), d = $("ldate").value;
+    const l = data.lifts.find(x => x.user_id === p.id && x.date < d && days.includes(x.workout));
+    return l ? { day: l.workout, date: l.date, next: days[(days.indexOf(l.workout) + 1) % days.length] } : null;
+  }
   const fmt = ss => ss.map(x => x.weight + "×" + x.reps).join(", ");
   function setsToday(p, ex) { const d = $("ldate").value; return data.lifts.filter(l => l.user_id === p.id && l.exercise === ex && l.date === d).sort((a, b) => a.id - b.id); }
   function lastTime(p, ex) {
@@ -562,7 +607,7 @@ const HTML = `<!doctype html>
     const date = prior[0].date;
     return { date, sets: prior.filter(l => l.date === date).sort((a, b) => a.id - b.id) };
   }
-  function remember() { try { localStorage.setItem("gt_workout", workout); localStorage.setItem("gt_step", today + ":" + step); } catch {} }
+  function remember() { try { localStorage.setItem("gt_program", program); localStorage.setItem("gt_workout", workout); localStorage.setItem("gt_step", today + ":" + step); } catch {} }
   const setRows = () => [...document.querySelectorAll("#sets .set")].filter(r => r.querySelector(".sw"));
 
   function fillFromHistory() {
@@ -580,9 +625,19 @@ const HTML = `<!doctype html>
     if (step < EX().length && tab === "workout") $("entry").scrollIntoView({ block: "nearest", behavior: "smooth" });
   }
 
+  function renderSelectors() {
+    $("psel").innerHTML = Object.entries(data.programs).map(([k, p]) => '<button type="button" data-p="' + k + '" aria-pressed="' + (k === program) + '">' + esc(p.name) + "</button>").join("");
+    [...$("psel").children].forEach(b => b.onclick = () => { if (program !== b.dataset.p) { program = b.dataset.p; const ls = lastSession(person); workout = ls ? ls.next : DAYS()[0]; go(0); } });
+    $("pblurb").textContent = PROG().blurb;
+    $("wsel").innerHTML = DAYS().map(d => '<button type="button" data-w="' + d + '" aria-pressed="' + (d === workout) + '">' + esc(d) + "</button>").join("");
+    [...$("wsel").children].forEach(b => b.onclick = () => { if (workout !== b.dataset.w) { workout = b.dataset.w; go(0); } });
+    const ls = lastSession(person);
+    $("nextup").innerHTML = ls ? esc(person.name) + " last did <b>" + esc(ls.day) + "</b> on " + ls.date + ". Next up: <b>" + esc(ls.next) + "</b>." : "No " + esc(PROG().name.toLowerCase()) + " sessions logged yet for " + esc(person.name) + ". Start with <b>" + esc(DAYS()[0]) + "</b>.";
+  }
+
   function renderFlow() {
-    [...$("wsel").children].forEach(b => b.setAttribute("aria-pressed", b.dataset.w === workout));
     const ex = EX(), n = ex.length;
+    renderSelectors();
     if (step > n) step = n;
     $("steps").innerHTML = ex.map((e, i) => {
       const mine = setsToday(person, e);
@@ -606,7 +661,6 @@ const HTML = `<!doctype html>
     }
     remember();
   }
-  [...$("wsel").children].forEach(b => b.onclick = () => { if (workout !== b.dataset.w) { workout = b.dataset.w; go(0); } });
   $("next").onclick = () => go(step + 1);
   $("prev").onclick = () => go(step - 1);
   $("ldate").onchange = () => go(step);
@@ -667,9 +721,13 @@ const HTML = `<!doctype html>
 
   function renderPBs() {
     let h = "<table><tr><th>Exercise</th>" + people().map(p => "<th>" + esc(p.name) + "</th>").join("") + "</tr>";
-    for (const w of ["A", "B"]) {
-      for (const ex of data.workouts[w]) {
-        h += "<tr><td>" + ex + "</td>" + people().map(p => { const b = bestFor(p, ex); return '<td class="n">' + (b ? b.weight + " × " + b.reps : "–") + "</td>"; }).join("") + "</tr>";
+    const seen = new Set();
+    for (const [k, p] of Object.entries(data.programs)) {
+      const exs = []; for (const ex of Object.values(p.days).flat()) if (!seen.has(ex)) { seen.add(ex); exs.push(ex); }
+      if (!exs.length) continue;
+      h += '<tr><th colspan="' + (people().length + 1) + '">' + esc(p.name) + (k === "split" ? " (extra exercises)" : "") + "</th></tr>";
+      for (const ex of exs) {
+        h += "<tr><td>" + ex + "</td>" + people().map(q => { const b = bestFor(q, ex); return '<td class="n">' + (b ? b.weight + " × " + b.reps : "–") + "</td>"; }).join("") + "</tr>";
       }
     }
     $("pbs").innerHTML = h + "</table>";
