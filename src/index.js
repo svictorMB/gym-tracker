@@ -55,6 +55,11 @@ const CUES = {
 // Logs saved before accounts existed are attached to whoever signs in with an email listed in
 // the LEGACY_USERS secret (JSON: {"email": "name in the old logs", ...}), and those people are
 // made buddies with each other automatically. Kept out of git so the emails stay private.
+// Emails in the TRAINERS secret (a JSON array) see, and can log for, everyone with a profile, not just buddies.
+function trainers(env) {
+  try { return JSON.parse(env.TRAINERS || "[]").map(e => String(e).toLowerCase()); } catch { return []; }
+}
+
 function legacyUsers(env) {
   try { return JSON.parse(env.LEGACY_USERS || "{}"); } catch { return {}; }
 }
@@ -236,7 +241,9 @@ async function api(request, env, url) {
   }
   if (!me.profile) return json({ error: "Finish setting up your profile first" }, 403);
 
-  const circle = [pub(me.profile), ...friends.accepted.map(({ fid, ...u }) => u)];
+  const isTrainer = trainers(env).includes(me.email);
+  const everyone = isTrainer ? (await sb(env, "profiles?select=id,seq,username,name&order=name")).filter(p => p.id !== me.id).map(pub) : null;
+  const circle = [pub(me.profile), ...(everyone || friends.accepted.map(({ fid, ...u }) => u))];
   const ids = circle.map(u => u.id);
   const inIds = "in.(" + ids.join(",") + ")";
   const nameOf = uid => (circle.find(u => u.id === uid) || {}).name;
@@ -247,7 +254,7 @@ async function api(request, env, url) {
       sbAll(env, "weights?user_id=" + inIds + "&select=id,user_id,logged_by,date,lbs&order=date.asc,id.asc"),
       sbAll(env, "lifts?user_id=" + inIds + "&select=id,user_id,logged_by,date,workout,exercise,weight,reps&order=date.desc,id.desc"),
     ]);
-    return json({ user: pub(me.profile), people: circle, friends, workouts: WORKOUTS, programs: PROGRAMS, cues: CUES, weights, lifts });
+    return json({ user: pub(me.profile), trainer: isTrainer, people: circle, friends, workouts: WORKOUTS, programs: PROGRAMS, cues: CUES, weights, lifts });
   }
 
   if (method === "POST" && path === "weight") {
@@ -424,7 +431,15 @@ const HTML = `<!doctype html>
   .nav button:disabled{opacity:.4}
   .finished{margin-top:14px;padding:14px;border-radius:10px;background:var(--bg);font-size:15px}
   .tabbar{position:sticky;top:0;z-index:5;display:flex;gap:4px;margin:12px -16px 4px;padding:8px 16px 0;background:var(--bg);border-bottom:1px solid var(--line)}
-  .tabbar button{flex:1;padding:10px 2px 9px;border:0;border-bottom:3px solid transparent;background:none;color:var(--muted);font-size:15px;font-weight:600;cursor:pointer;white-space:nowrap}
+  .tabbar button{flex:1;padding:10px 2px 9px;border:0;border-bottom:3px solid transparent;background:none;color:var(--muted);font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap}
+  .badge{display:inline-block;font-size:11px;font-weight:600;padding:1px 7px;border-radius:999px;background:var(--accent);color:#fff;margin-left:6px;vertical-align:middle}
+  .wsum{margin-top:12px}
+  .wsum small{color:var(--muted);font-size:11px}
+  .pcard{padding:10px 0;border-bottom:1px solid var(--line)}
+  .pcard:last-child{border-bottom:0;padding-bottom:0}
+  .pname{font-weight:600;font-size:16px}
+  .pline{font-size:14px;color:var(--muted);margin-top:2px}
+  .pline b{color:var(--ink);font-weight:600}
   .tabbar button[aria-selected=true]{color:var(--accent);border-bottom-color:var(--accent)}
   section.tab>h2:first-child{margin-top:16px}
   [hidden]{display:none !important}
@@ -470,6 +485,7 @@ const HTML = `<!doctype html>
     <nav class="tabbar" id="tabbar" role="tablist" aria-label="Sections">
       <button type="button" data-tab="workout" role="tab" id="tab-workout" aria-controls="panel-workout">Workout</button>
       <button type="button" data-tab="weigh" role="tab" id="tab-weigh" aria-controls="panel-weigh">Weigh in</button>
+      <button type="button" data-tab="progress" role="tab" id="tab-progress" aria-controls="panel-progress">Progress</button>
       <button type="button" data-tab="bests" role="tab" id="tab-bests" aria-controls="panel-bests">Bests</button>
       <button type="button" data-tab="recent" role="tab" id="tab-recent" aria-controls="panel-recent">Recent</button>
     </nav>
@@ -521,6 +537,11 @@ const HTML = `<!doctype html>
     <div class="panel" id="chart"><p class="empty">No weigh-ins yet. The chart appears after the first one.</p></div>
     </section>
 
+    <section class="tab" data-tab="progress" role="tabpanel" id="panel-progress" aria-labelledby="tab-progress" hidden>
+    <h2>Progress</h2>
+    <div class="panel" id="progress"></div>
+    </section>
+
     <section class="tab" data-tab="bests" role="tabpanel" id="panel-bests" aria-labelledby="tab-bests" hidden>
     <h2>Personal bests</h2>
     <div class="panel wrap" id="pbs"></div>
@@ -563,7 +584,7 @@ const HTML = `<!doctype html>
 
   // ----- tabs -----
   let tab = "workout";
-  try { const t = localStorage.getItem("gt_tab"); if (["workout", "weigh", "bests", "recent"].includes(t)) tab = t; } catch {}
+  try { const t = localStorage.getItem("gt_tab"); if (["workout", "weigh", "progress", "bests", "recent"].includes(t)) tab = t; } catch {}
   function showTab(t) {
     tab = t;
     [...document.querySelectorAll("section.tab")].forEach(sec => sec.hidden = sec.dataset.tab !== t);
@@ -641,8 +662,8 @@ const HTML = `<!doctype html>
     data = await api("data"); me = data.user;
     person = byId(person ? person.id : savedPersonId) || people()[0];
     show("app");
-    $("mename").textContent = me.name + " · @" + me.username;
-    renderWho(); renderBuddies(); renderChart(); renderPBs(); renderRecent();
+    $("mename").innerHTML = esc(me.name) + " · @" + esc(me.username) + (data.trainer ? '<span class="badge">Trainer</span>' : "");
+    renderWho(); renderBuddies(); renderChart(); renderProgress(); renderPBs(); renderRecent();
     if (firstLoad) { firstLoad = false; go(step); } else renderFlow();
   }
 
@@ -809,7 +830,38 @@ const HTML = `<!doctype html>
     });
     svg += '<text x="40" y="232" font-size="11" fill="var(--muted)">' + dates[0] + '</text><text x="580" y="232" text-anchor="end" font-size="11" fill="var(--muted)">' + dates[dates.length - 1] + "</text></svg>";
     svg += '<div class="legend">' + people().map(p => { const last = W.filter(w => w.user_id === p.id).slice(-1)[0]; return '<span><i class="chip" style="background:' + p.color + '"></i>' + esc(p.name) + (last ? " " + last.lbs + " lb" : "") + "</span>"; }).join("") + "</div>";
+    const rows = people().map(p => {
+      const pts = W.filter(w => w.user_id === p.id); if (!pts.length) return "";
+      const a = pts[0], b = pts[pts.length - 1];
+      return '<tr><td><i class="chip" style="background:' + p.color + '"></i>' + esc(p.name) + '</td><td class="n">' + a.lbs + "<br><small>" + a.date + '</small></td><td class="n">' + b.lbs + "<br><small>" + b.date + '</small></td><td class="n">' + signed(b.lbs - a.lbs) + " lb</td></tr>";
+    }).join("");
+    svg += '<div class="wrap"><table class="wsum"><tr><th>Who</th><th>Start</th><th>Now</th><th>Change</th></tr>' + rows + "</table></div>";
     $("chart").innerHTML = svg;
+  }
+  const signed = x => (x > 0 ? "+" : "") + x.toFixed(1);
+
+  // One card per person: body weight start to now, and how consistently they are training.
+  function renderProgress() {
+    const since = localDate(new Date(Date.now() - 28 * 864e5));
+    let h = data.trainer ? '<p class="hint" style="margin:0 0 4px">You are a trainer, so this covers everyone with a profile.</p>' : "";
+    for (const p of people()) {
+      const W = data.weights.filter(w => w.user_id === p.id);
+      const first = W[0], last = W[W.length - 1];
+      const dates = [...new Set(data.lifts.filter(l => l.user_id === p.id).map(l => l.date))];
+      const recent = dates.filter(d => d >= since).length;
+      const lastLift = data.lifts.find(l => l.user_id === p.id);
+      let wl = "No weigh-ins yet.";
+      if (first && W.length === 1) wl = "Weighed in once: <b>" + first.lbs + " lb</b> on " + first.date + ".";
+      else if (first) {
+        const d = last.lbs - first.lbs, pct = first.lbs ? d / first.lbs * 100 : 0;
+        wl = "<b>" + first.lbs + "</b> → <b>" + last.lbs + " lb</b>, <b>" + signed(d) + " lb</b> (" + signed(pct) + "%) since " + first.date + ". " + W.length + " weigh-ins, latest " + last.date + ".";
+      }
+      const tl = lastLift
+        ? "<b>" + recent + "</b> session" + (recent === 1 ? "" : "s") + " in the last 4 weeks, " + dates.length + " total. Last: <b>" + esc(lastLift.workout) + "</b> on " + lastLift.date + "."
+        : "No sets logged yet.";
+      h += '<div class="pcard"><div class="pname"><i class="chip" style="background:' + p.color + '"></i>' + esc(p.name) + '</div><div class="pline">' + wl + '</div><div class="pline">' + tl + "</div></div>";
+    }
+    $("progress").innerHTML = h || '<p class="empty">Nobody here yet.</p>';
   }
 
   function renderPBs() {
