@@ -25,7 +25,37 @@ const PROGRAMS = {
   },
 };
 // Every workout day across programs, keyed by day name (used for validation and the guided flow).
-const WORKOUTS = Object.fromEntries(Object.values(PROGRAMS).flatMap(p => Object.entries(p.days)));
+// Equipment variations for the muscle split, keyed by the default exercise. Each logs under its own name,
+// so every variation keeps its own history and personal best.
+const VARIANTS = {
+  "Chest press machine": ["Barbell bench press", "Dumbbell bench press", "Cable chest press"],
+  "Incline dumbbell press": ["Incline barbell bench press", "Incline machine press", "Push-ups (reps)"],
+  "Seated shoulder press machine": ["Barbell overhead press", "Dumbbell shoulder press", "Arnold press"],
+  "Cable chest fly": ["Dumbbell fly", "Pec deck machine", "Push-ups (reps)"],
+  "Dumbbell lateral raise": ["Cable lateral raise", "Machine lateral raise", "Barbell upright row"],
+  "Triceps pushdown": ["Overhead cable triceps extension", "Dumbbell skull crushers", "Close-grip barbell bench press", "Dips (reps)"],
+  "Lat pulldown": ["Pull-ups (reps)", "Assisted pull-up machine", "Straight-arm cable pulldown"],
+  "Seated cable row": ["Barbell bent-over row", "Chest-supported dumbbell row", "Machine row"],
+  "Single-arm dumbbell row": ["Single-arm cable row", "T-bar row", "Inverted row (reps)"],
+  "Cable face pull": ["Rear delt fly machine", "Bent-over dumbbell rear delt fly", "Band pull-apart"],
+  "Dumbbell biceps curl": ["Barbell curl", "Cable curl", "Preacher curl machine"],
+  "Cable hammer curl": ["Dumbbell hammer curl", "Incline dumbbell curl", "Reverse barbell curl"],
+  "Leg press": ["Barbell back squat", "Hack squat machine", "Goblet squat"],
+  "Dumbbell Romanian deadlift": ["Barbell Romanian deadlift", "Barbell deadlift", "Cable pull-through"],
+  "Seated leg curl": ["Lying leg curl machine", "Nordic hamstring curl (reps)", "Stability ball leg curl (reps)"],
+  "Leg extension": ["Bulgarian split squat (reps per side)", "Sissy squat (reps)", "Barbell front squat"],
+  "Walking lunges (reps per side)": ["Reverse lunges (reps per side)", "Bulgarian split squat (reps per side)", "Step-ups (reps per side)"],
+  "Standing calf raise": ["Seated calf raise machine", "Leg press calf raise", "Single-leg calf raise (reps per side)"],
+  "Plank (seconds)": ["Side plank (seconds per side)", "Hanging knee raise (reps)", "Ab wheel rollout (reps)", "Cable crunch"],
+  "Goblet squat": ["Barbell back squat", "Barbell front squat", "Hack squat machine"],
+  "Hip thrust machine": ["Barbell hip thrust", "Dumbbell hip thrust", "Glute bridge (reps)", "Cable kickback (reps per side)"],
+  "Dead bug (reps per side)": ["Cable crunch", "Hanging knee raise (reps)", "Ab wheel rollout (reps)"],
+};
+// Each day is a list of slots: [default exercise, ...variations]. Only the split program offers variations.
+const slotsOf = (programKey, names) => names.map(n => programKey === "split" && VARIANTS[n] ? [n, ...VARIANTS[n]] : [n]);
+const PROGRAM_SLOTS = Object.fromEntries(Object.entries(PROGRAMS).map(([k, p]) => [k, { ...p, days: Object.fromEntries(Object.entries(p.days).map(([d, names]) => [d, slotsOf(k, names)])) }]));
+// Every exercise allowed on each day, including variations (used to validate what gets logged).
+const WORKOUTS = Object.fromEntries(Object.values(PROGRAM_SLOTS).flatMap(p => Object.entries(p.days).map(([d, slots]) => [d, slots.flat()])));
 
 const CUES = {
   "Leg press": "Feet shoulder-width on the plate. Lower until the knees are near 90°, press back up without locking out.",
@@ -50,6 +80,66 @@ const CUES = {
   "Walking lunges (reps per side)": "Long step, back knee toward the floor, front shin vertical. Push through the front heel. Log steps per leg.",
   "Standing calf raise": "Full stretch at the bottom, pause at the top. Slow and controlled, no bouncing.",
   "Hip thrust machine": "Pad above the hips, chin tucked. Drive up until the hips are fully extended and squeeze the glutes at the top.",
+  "Barbell bench press": "Feet planted, shoulder blades pinched, bar to mid-chest with elbows about 45°. Press up and slightly back. Use a spotter or safeties.",
+  "Dumbbell bench press": "Dumbbells over the chest, lower until the elbows are just below the bench, press up and in.",
+  "Cable chest press": "Cables at shoulder height, step forward into a split stance, press forward and squeeze the chest.",
+  "Incline barbell bench press": "Bench at 30°, bar to the upper chest, elbows tucked a little. Don't bounce it off the chest.",
+  "Incline machine press": "Seat so the handles start at upper-chest height. Press smoothly, control the return.",
+  "Push-ups (reps)": "Hands under the shoulders, body straight, chest to the floor and back up. Log 0 lbs and the reps.",
+  "Barbell overhead press": "Bar at the collarbone, brace the core, press straight up and move the head through at the top. No leg drive.",
+  "Dumbbell shoulder press": "Dumbbells at shoulder height, palms forward, press up without the elbows flaring behind you.",
+  "Arnold press": "Start palms facing you at shoulder height, rotate the palms out as you press overhead, reverse on the way down.",
+  "Dumbbell fly": "Slight elbow bend, lower the dumbbells out wide until you feel a chest stretch, bring them back over the chest.",
+  "Pec deck machine": "Elbows level with the shoulders, bring the pads together in front of the chest, open slowly.",
+  "Cable lateral raise": "Cable low and across the body, raise the arm out to shoulder height, lower under control.",
+  "Machine lateral raise": "Pads on the upper arms, raise to shoulder height, pause, lower slowly.",
+  "Barbell upright row": "Wide grip, pull the bar to the lower chest with the elbows high, lower slowly. Skip it if the shoulders pinch.",
+  "Overhead cable triceps extension": "Rope overhead, elbows by the ears, extend fully and return slowly for a stretch.",
+  "Dumbbell skull crushers": "Lying down, lower the dumbbells beside the head by bending only the elbows, extend back up.",
+  "Close-grip barbell bench press": "Hands about shoulder-width, elbows tucked, bar to the lower chest, press up.",
+  "Dips (reps)": "Lean slightly forward, lower until the upper arms are parallel, press up. Log 0 lbs (or added weight) and reps.",
+  "Pull-ups (reps)": "Hang fully, pull the chest to the bar leading with the elbows, lower all the way. Log 0 lbs (or added weight).",
+  "Assisted pull-up machine": "Knees on the pad; the weight you pick is the help, so less weight is harder. Pull the chest to the bar.",
+  "Straight-arm cable pulldown": "Standing, arms nearly straight, push the bar down to the thighs with the lats, return slowly.",
+  "Barbell bent-over row": "Hinge to about 45°, flat back, row the bar to the lower chest, squeeze the back, lower slowly.",
+  "Chest-supported dumbbell row": "Chest on an incline bench, row the dumbbells to the hips, squeeze the shoulder blades.",
+  "Machine row": "Chest on the pad, pull the handles back with the elbows, squeeze, return under control.",
+  "Single-arm cable row": "Split stance, pull the handle to the hip with one arm, rotate slightly, return slowly. Log reps per arm.",
+  "T-bar row": "Chest up, hinge forward, pull the handles to the chest, squeeze the back.",
+  "Inverted row (reps)": "Hang under a bar, body straight, pull the chest to the bar, lower slowly. Log 0 lbs and reps.",
+  "Rear delt fly machine": "Chest on the pad, arms level with the shoulders, open the arms back, squeeze, return slowly.",
+  "Bent-over dumbbell rear delt fly": "Hinge forward, slight elbow bend, raise the dumbbells out to the sides, squeeze the rear shoulders.",
+  "Band pull-apart": "Band at shoulder height, arms straight, pull it apart to the chest, squeeze, return slowly. Log 0 lbs.",
+  "Barbell curl": "Elbows at the sides, curl the bar up without swinging, lower slowly to straight arms.",
+  "Cable curl": "Low cable, elbows still, curl to the shoulders, lower slowly for constant tension.",
+  "Preacher curl machine": "Upper arms flat on the pad, curl fully, lower almost to straight without resting.",
+  "Dumbbell hammer curl": "Palms facing each other, curl to the shoulders, elbows stay put, lower slowly.",
+  "Incline dumbbell curl": "Seated on an incline bench, arms hanging back, curl up without moving the elbows forward.",
+  "Reverse barbell curl": "Palms down, curl the bar up with the forearms, lower slowly. Go light.",
+  "Barbell back squat": "Bar on the upper back, brace, sit down between the knees until the thighs are at least parallel, drive up. Use safeties.",
+  "Hack squat machine": "Back flat on the pad, feet mid-platform, lower to about 90° and press through the whole foot.",
+  "Barbell Romanian deadlift": "Soft knees, hinge at the hips with a flat back, bar close to the legs, stand up by squeezing the glutes.",
+  "Barbell deadlift": "Bar over mid-foot, flat back, push the floor away and stand tall. Lower with a hip hinge. Start light and learn the form first.",
+  "Cable pull-through": "Face away from a low cable, rope between the legs, hinge forward and drive the hips through.",
+  "Lying leg curl machine": "Pad above the heels, hips down, curl fully and return slowly.",
+  "Nordic hamstring curl (reps)": "Ankles held, lower the body forward as slowly as you can, push back up with hands if needed. Log 0 lbs.",
+  "Stability ball leg curl (reps)": "Heels on the ball, hips up, pull the ball in with the heels, extend slowly. Log 0 lbs.",
+  "Bulgarian split squat (reps per side)": "Rear foot on a bench, lower straight down until the front thigh is parallel, drive up. Log reps per leg.",
+  "Sissy squat (reps)": "Hold a support, lean back and bend the knees forward, lower as far as the quads allow, return. Log 0 lbs.",
+  "Barbell front squat": "Bar on the front of the shoulders, elbows high, sit straight down and drive up keeping the chest tall.",
+  "Reverse lunges (reps per side)": "Step back, lower the back knee toward the floor, push through the front heel to stand. Log reps per leg.",
+  "Step-ups (reps per side)": "Whole foot on the box, drive through that heel to stand up, lower slowly. Log reps per leg.",
+  "Seated calf raise machine": "Pad on the thighs, full stretch at the bottom, pause at the top. Slow and controlled.",
+  "Leg press calf raise": "Toes on the bottom edge of the platform, press through the balls of the feet, full stretch each rep.",
+  "Single-leg calf raise (reps per side)": "Hold a support, raise on one foot with a pause at the top, lower to a stretch. Log reps per leg.",
+  "Side plank (seconds per side)": "Elbow under the shoulder, hips lifted and stacked, body straight. Log the seconds held per side.",
+  "Hanging knee raise (reps)": "Hang from the bar, raise the knees toward the chest without swinging, lower slowly. Log 0 lbs.",
+  "Ab wheel rollout (reps)": "From the knees, roll out as far as you can keep the back flat, pull back with the abs. Log 0 lbs.",
+  "Cable crunch": "Kneel facing a high cable, rope behind the head, crunch the elbows toward the knees, return slowly.",
+  "Barbell hip thrust": "Upper back on a bench, bar over the hips with a pad, drive up until the hips are level and squeeze the glutes.",
+  "Dumbbell hip thrust": "Upper back on a bench, dumbbell on the hips, drive up and squeeze the glutes at the top.",
+  "Glute bridge (reps)": "On your back, knees bent, drive the hips up and squeeze the glutes, lower slowly. Log 0 lbs.",
+  "Cable kickback (reps per side)": "Ankle strap on a low cable, kick the leg back with the glute, control the return. Log reps per leg.",
 };
 
 // Logs saved before accounts existed are attached to whoever signs in with an email listed in
@@ -81,6 +171,7 @@ const RX = {
   "Hip thrust machine": { sets: 4, reps: "10–12", target: 10 },
 };
 const RX_DEFAULT = { sets: 3, reps: "10–12", target: 10 };
+for (const [base, vs] of Object.entries(VARIANTS)) for (const v of vs) if (!RX[v] && RX[base]) RX[v] = RX[base];
 
 const PALETTE = ["#1F4FD8", "#D9772B", "#1E8E55", "#8E44AD", "#C2185B", "#00838F", "#6D4C41", "#455A64"];
 
@@ -272,7 +363,7 @@ async function api(request, env, url) {
       sbAll(env, "weights?user_id=" + inIds + "&select=id,user_id,logged_by,date,lbs&order=date.asc,id.asc"),
       sbAll(env, "lifts?user_id=" + inIds + "&select=id,user_id,logged_by,date,workout,exercise,weight,reps&order=date.desc,id.desc"),
     ]);
-    return json({ user: pub(me.profile), trainer: isTrainer, people: circle, friends, workouts: WORKOUTS, programs: PROGRAMS, cues: CUES, rx: RX, rxDefault: RX_DEFAULT, weights, lifts });
+    return json({ user: pub(me.profile), trainer: isTrainer, people: circle, friends, workouts: WORKOUTS, programs: PROGRAM_SLOTS, cues: CUES, rx: RX, rxDefault: RX_DEFAULT, weights, lifts });
   }
 
   if (method === "POST" && path === "weight") {
@@ -442,6 +533,8 @@ const HTML = `<!doctype html>
   .current{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
   .stepn{font-size:13px;color:var(--muted)}
   .exname{font-size:20px;font-weight:700;margin:2px 0 4px}
+  .swap{margin:2px 0 8px}
+  .swap label{margin-bottom:3px}
   .cue{font-size:14px;color:var(--muted);margin:0 0 6px}
   .rxrow{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:0 0 8px;font-size:14px}
   .rxrow b{font-weight:600}
@@ -526,6 +619,7 @@ const HTML = `<!doctype html>
       <div class="current" id="entry">
         <div class="stepn" id="stepn"></div>
         <div class="exname" id="exname"></div>
+        <div class="swap" id="swap" hidden><label for="variant">Equipment / variation</label><select id="variant"></select></div>
         <p class="cue" id="cue"></p>
         <div class="rxrow"><span id="rx"></span><a class="howto" id="howto" href="#" target="_blank" rel="noopener">▶ Watch how to do it</a></div>
         <p class="last" id="last"></p>
@@ -723,7 +817,17 @@ const HTML = `<!doctype html>
   // ----- guided workout -----
   const PROG = () => data.programs[program] || (program = "fullbody", data.programs.fullbody);
   const DAYS = () => Object.keys(PROG().days);
-  const EX = () => { if (!PROG().days[workout]) workout = DAYS()[0]; return PROG().days[workout]; };
+  const SLOTS = () => { if (!PROG().days[workout]) workout = DAYS()[0]; return PROG().days[workout].map(x => Array.isArray(x) ? x : [x]); };
+  const varKey = (p, slot) => "gt_var:" + p.id + ":" + slot[0];
+  // Which variation to show for a slot: the one this person picked on this phone, else the one they logged most recently, else the default.
+  function chosen(p, slot) {
+    if (slot.length === 1) return slot[0];
+    let pick = null; try { pick = localStorage.getItem(varKey(p, slot)); } catch {}
+    if (pick && slot.includes(pick)) return pick;
+    const recent = data.lifts.find(l => l.user_id === p.id && slot.includes(l.exercise));
+    return recent ? recent.exercise : slot[0];
+  }
+  const EX = () => SLOTS().map(slot => chosen(person, slot));
   function lastSession(p) {
     const days = DAYS(), d = $("ldate").value;
     const l = data.lifts.find(x => x.user_id === p.id && x.date < d && days.includes(x.workout));
@@ -790,6 +894,9 @@ const HTML = `<!doctype html>
     } else {
       $("stepn").textContent = "Exercise " + (step + 1) + " of " + n;
       $("exname").textContent = ex[step];
+      const slot = SLOTS()[step];
+      $("swap").hidden = slot.length < 2;
+      if (slot.length > 1) $("variant").innerHTML = slot.map(v => "<option" + (v === ex[step] ? " selected" : "") + ">" + esc(v) + "</option>").join("");
       $("cue").textContent = (data.cues || {})[ex[step]] || "";
       const rx = rxFor(ex[step]);
       $("rx").innerHTML = "Recommended: <b>" + rx.sets + " sets × " + esc(rx.reps) + "</b>";
@@ -804,6 +911,7 @@ const HTML = `<!doctype html>
   $("next").onclick = () => go(step + 1);
   $("prev").onclick = () => go(step - 1);
   $("ldate").onchange = () => go(step);
+  $("variant").onchange = () => { try { localStorage.setItem(varKey(person, SLOTS()[step]), $("variant").value); } catch {} go(step); };
 
   function bestFor(p, ex, skipDate) {
     return data.lifts.filter(l => l.user_id === p.id && l.exercise === ex && l.date !== skipDate).sort((a, b) => b.weight - a.weight || b.reps - a.reps)[0];
@@ -895,7 +1003,13 @@ const HTML = `<!doctype html>
     let h = "<table><tr><th>Exercise</th>" + people().map(p => "<th>" + esc(p.name) + "</th>").join("") + "</tr>";
     const seen = new Set();
     for (const [k, p] of Object.entries(data.programs)) {
-      const exs = []; for (const ex of Object.values(p.days).flat()) if (!seen.has(ex)) { seen.add(ex); exs.push(ex); }
+      const exs = [];
+      for (const slot of Object.values(p.days).flatMap(d => d.map(x => Array.isArray(x) ? x : [x]))) {
+        for (const ex of slot) {
+          if (seen.has(ex) || (ex !== slot[0] && !people().some(q => bestFor(q, ex)))) continue;
+          seen.add(ex); exs.push(ex);
+        }
+      }
       if (!exs.length) continue;
       h += '<tr><th colspan="' + (people().length + 1) + '">' + esc(p.name) + (k === "split" ? " (extra exercises)" : "") + "</th></tr>";
       for (const ex of exs) {
